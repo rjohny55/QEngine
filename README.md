@@ -89,7 +89,7 @@ Older releases and what changed in each: [releases page](https://github.com/bpx0
 
 More settings, measurements and the troubleshooting table: [docs/advanced.md](docs/advanced.md).
 
-The `cmp50-sm75` branch has an [experimental Turing build](docs/sm75.md) for CMP 50HX.
+This fork adds [CMP 170HX (Ampere)](docs/sm80.md) and [experimental CMP 50HX (Turing)](docs/sm75.md) builds.
 
 ## Quick start
 
@@ -144,7 +144,7 @@ docker run -d --name qengine --restart unless-stopped --gpus all --ipc=host --ul
   from this checkout (it does not pull `ghcr.io/bpx03/qengine`) and serves the 27B; for Flash-Next add
   `QE_MODEL: /app/models/Qwen3.8-Flash-Next-QE-INT4` under `environment:`.
 - Build it yourself: `docker build -t qengine .` (with vision), `--build-arg VISION=0` (text only),
-  `--build-arg CUDA_ARCHS=86` (RTX 3090 code only, faster build), `--build-arg REVISION=$(git rev-parse HEAD)` (the
+  `--build-arg CUDA_ARCHS=80` (CMP 170HX only) or `86` (RTX 3090 only), `--build-arg REVISION=$(git rev-parse HEAD)` (the
   build hash the monitoring headers show; without it they say `build unknown`).
 
 ### 2b. Or build from source
@@ -257,11 +257,12 @@ the `[qflash] parallel mode` line and the `host RAM plan` line are what I need t
 
 ### GPUs
 
-QEngine runs on the RTX 3000, 4000 and 5000 series with no extra steps. The Docker images carry the code for all three,
-and a source build targets the GPUs it finds (`-DCMAKE_CUDA_ARCHITECTURES` sets others).
+This fork’s Docker build includes sm_80, sm_86, sm_89 and sm_120 by default. A source build targets the GPUs it
+finds (`-DCMAKE_CUDA_ARCHITECTURES` sets others).
 
-| series | code | what has run on it |
+| series | code | validation |
 |---|---|---|
+| CMP 170HX | sm_80 | Native build for both engines. [Setup and validation](docs/sm80.md). |
 | RTX 3000 | sm_86 | 3090: all tuning (82 SMs, tile shapes, split counts, memory budgets) targets it, and everything published here was measured on it. Community: 4× modded 3080 20 GB ([#9](https://github.com/bpx03/QEngine/issues/9)) |
 | RTX 4000 | sm_89 | built, but no run on record yet; reports are welcome |
 | RTX 5000 | sm_120 | community: 2× 5090 ([club-3090 #1826](https://github.com/noonghunna/club-3090/issues/1826)), 4× 5080 16 GB ([#13](https://github.com/bpx03/QEngine/issues/13)) |

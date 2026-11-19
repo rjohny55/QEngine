@@ -1,3 +1,4 @@
+#include "kernels/cuda_compat.cuh"
 #include "../env.h"
 // DFlash2 block drafter kernels (dflash.cuh)
 #include <cfloat>
@@ -268,9 +269,7 @@ static_assert(kAmPairs * kAmK * 4 <= kAmK * kAmKs * 2, "attn_mma aliasing");
 constexpr size_t kAmSmem = (size_t)kAmK * kAmKs * 2 + (size_t)kDflHd * kAmVt * 2 + (size_t)kAmPairs * kAmPb * 2 + kAmK * 4 + kAmPairs * 8;
 static_assert(kAmSmem + 64 <= 48 * 1024, "attn_mma: within the default dynamic smem (no per-device attribute; review L5)");
 __device__ __forceinline__ void am_mma(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_bf16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 __global__ void __launch_bounds__(256) attn_mma_kernel(const bf16* __restrict__ q, const bf16* __restrict__ kb,
                                                        const bf16* __restrict__ vb, const DflRing* __restrict__ ring, int l,

@@ -294,17 +294,27 @@ void Worker::rows8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m
         gemv_w8_rows(w, x, ldx, y, ldy, m, st);
         return;
     }
+    const bool two_stages = smem_limit_ < RQ_SMEM;
     if (!rq_attr_) {
-        CUDA_CHECK(cudaFuncSetAttribute(k_rows_qt<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)rq_smem<4>()));
-        CUDA_CHECK(cudaFuncSetAttribute(k_rows_qt<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)rq_smem<3>()));
-        CUDA_CHECK(cudaFuncSetAttribute(k_rows_qt<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)rq_smem<2>()));
-        CUDA_CHECK(cudaDeviceGetAttribute(&rq_sms_, cudaDevAttrMultiProcessorCount, dev_));
+        if (two_stages) {
+            CUDA_CHECK(cudaFuncSetAttribute(k_rows_qt<3, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)rq_smem<3, 2>()));
+        } else {
+            CUDA_CHECK(cudaFuncSetAttribute(k_rows_qt<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)rq_smem<4>()));
+            CUDA_CHECK(cudaFuncSetAttribute(k_rows_qt<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)rq_smem<3>()));
+            CUDA_CHECK(cudaFuncSetAttribute(k_rows_qt<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)rq_smem<2>()));
+            CUDA_CHECK(cudaDeviceGetAttribute(&rq_sms_, cudaDevAttrMultiProcessorCount, dev_));
+        }
+        rq_attr_ = true;
     }
-    rq_attr_ = true;
     int8_t* xq = reinterpret_cast<int8_t*>(pfact_);
     float2* xs = reinterpret_cast<float2*>(xq + (size_t)m * w.k);
     lend_use(xq, need, "row GEMM workspace (pfact_)");
     k_x_to_r8<<<m, w.k / 16, 0, st>>>(x, ldx, w.k, xq, xs);
+    if (two_stages) {
+        k_rows_qt<3, 2><<<dim3((m + RQ_TB - 1) / RQ_TB, (w.n + 95) / 96), 256, rq_smem<3, 2>(), st>>>(
+            w.q, w.s, w.k, w.n, xq, xs, y, ldy, m);
+        return;
+    }
     // weight-block width ([fp-rq]): TA weight tiles per warp (32 TA rows per block, one block per SM). Model: waves x
     // wave time, a wave of TA-blocks ~ TA + 0.75 units (fit 5504 x 2560, 512 rows: 42.9 / 35.5 / 25.0 us per wave for
     // TA 4 / 3 / 2). A narrower block only when the model gains >= 5 % and m >= 128 (m < 128 is slower for every TA,
@@ -785,6 +795,7 @@ static YarnTab yarn_table(double factor) {
 
 Worker::Worker(const Plan& p, int device, const Comm& comm, int max_ctx) : p_(p), dev_(device), max_ctx_(max_ctx), comm_(comm) {
     CUDA_CHECK(cudaSetDevice(dev_));
+    smem_limit_ = qe_shared_memory_limit();
     gctx_ = green_ctx_for(dev_, &gsms_);  // (TP ranks sharing this card: its SM share; else null)
     mkstream(&st_, cudaStreamNonBlocking, 0);
     if (const double yf = yarn_factor(); yf > 0) {
@@ -831,7 +842,8 @@ Worker::Worker(const Plan& p, int device, const Comm& comm, int max_ctx) : p_(p)
     if (!p_.pp() || dev_first_) qe_wd_init(wdid_, dev_);
     qe_wd_stream(wdid_, dev_, (void*)st_);
     gemv_workspace_init();
-    CUDA_CHECK(cudaFuncSetAttribute(k_qsa_attn_tc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TA_SMEM));
+    if (TA_SMEM <= smem_limit_)
+        CUDA_CHECK(cudaFuncSetAttribute(k_qsa_attn_tc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TA_SMEM));
     CUDA_CHECK(cudaFuncSetAttribute(k_qsa_attn_tc2<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TB_SMEM));
     CUDA_CHECK(cudaFuncSetAttribute(k_qsa_attn_tc2<2, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TB_SMEM));
     CUDA_CHECK(cudaFuncSetAttribute(k_qsa_attn_tc2<2, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TB_SMEM));
@@ -845,7 +857,6 @@ Worker::Worker(const Plan& p, int device, const Comm& comm, int max_ctx) : p_(p)
     ctr_.epoch = (unsigned*)dalloc(4);
     comm_bind_ll_scrub(ctr_, comm_, p_.rank);
     ctr_.ready = (unsigned*)dalloc(4096 * 4);
-    CUDA_CHECK(cudaFuncSetAttribute(k_dn_rec, cudaFuncAttributeMaxDynamicSharedMemorySize, (128 * 128 + 256) * 4));
 }
 
 // test hook FLASH_TEST_VRAM_HOG_MB=n: after load every card allocates all its free memory but n MB and keeps it (a
@@ -1972,7 +1983,10 @@ void Worker::alloc_state() {
         agq_r8_ = (int8_t*)dalloc((size_t)AC * H);
         agq_r8s_ = (float2*)dalloc((size_t)AC * (H / 128) * 8);
         agq_rlog_ = (float*)dalloc((size_t)AC * 528 * 4);
-        CUDA_CHECK(cudaFuncSetAttribute(k_rows_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)RQ_SMEM));
+        if (RQ_SMEM > smem_limit_)
+            CUDA_CHECK(cudaFuncSetAttribute(k_rows_qt<3, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)rq_smem<3, 2>()));
+        else
+            CUDA_CHECK(cudaFuncSetAttribute(k_rows_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)RQ_SMEM));
     }
     // decode rows alias the prefill buffers (never live at the same time; every forward starts from the embedding),
     // except the decode-only ping-pong residuals
@@ -2092,19 +2106,26 @@ void Worker::alloc_state() {
     attn_split_ = env_int("FLASH_ATTN_SPLIT", 4);  // decode attention key splits (1: old kernel)
     attn_split_ = std::max(1, std::min(8, attn_split_));
     dec_k_ = env_int("FLASH_ATTN_DEC", 1);  // GQA-tile decode attention (0: tc2 / old)
+    if (QD_SMEM > smem_limit_ && std::count(comm_.dev, comm_.dev + p_.ngpu, dev_) > 1) {
+        // KV1 can occupy all SMs while waiting for the other rank's exchange on this card.
+        dec_k_ = false;
+    }
     if (!dec_k_ && env_int("FLASH_ATTN_CHUNK", 0) && p_.rank == 0)
         fprintf(stderr, "[flash] FLASH_ATTN_CHUNK=1 with FLASH_ATTN_DEC=0: decode attention is not batch-invariant (the chunked key "
                         "splits live in the default decode kernel)\n");
     dec_split_ = env_set("FLASH_ATTN_DSPLIT") ? std::max(1, std::min(8, env_int("FLASH_ATTN_DSPLIT", 8))) : 8;
     if (dec_k_) attn_split_ = std::max(attn_split_, dec_split_);
-    CUDA_CHECK(cudaFuncSetAttribute(k_qsa_dec<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)QD_SMEM));
+    if (QD_SMEM <= smem_limit_)
+        CUDA_CHECK(cudaFuncSetAttribute(k_qsa_dec<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)QD_SMEM));
     CUDA_CHECK(cudaFuncSetAttribute(k_qsa_dec<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)QD_SMEM1));
     // 2 KV1 blocks per SM need the 100 KB carveout (1 block fits the 64 KB one): ask for it (review L1)
     CUDA_CHECK(cudaFuncSetAttribute(k_qsa_dec<true>, cudaFuncAttributePreferredSharedMemoryCarveout, (int)cudaSharedmemCarveoutMaxShared));
-    CUDA_CHECK(cudaFuncSetAttribute(k_qsa_dec<false, 0, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)QD_SMEM));
+    if (QD_SMEM <= smem_limit_)
+        CUDA_CHECK(cudaFuncSetAttribute(k_qsa_dec<false, 0, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)QD_SMEM));
     CUDA_CHECK(cudaFuncSetAttribute(k_qsa_dec<true, 0, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)QD_SMEM1));
     CUDA_CHECK(cudaFuncSetAttribute(k_qsa_dec<true, 0, true>, cudaFuncAttributePreferredSharedMemoryCarveout, (int)cudaSharedmemCarveoutMaxShared));
-    CUDA_CHECK(cudaFuncSetAttribute(k_idx_score_t, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)IS_SMEM));
+    if (IS_SMEM <= smem_limit_)
+        CUDA_CHECK(cudaFuncSetAttribute(k_idx_score_t, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)IS_SMEM));
     CUDA_CHECK(cudaFuncSetAttribute(k_idx_score_mma, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)IT_SMEM));
     if (attn_split_ > 1) attn_spl_ = (float*)dalloc((size_t)(attn_split_ - 1) * XROWS * NQ * (HD + 2) * 4);
     mtok_ = (int*)dalloc(pfbn_ * 4);
@@ -4163,7 +4184,7 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
         k_dn_conv_d<<<(ch + 255) / 256, 256, 0, st_>>>(proj_, ld, ch, L.conv_w, L.conv_hist, L.conv_pend, posd_ + 1, cv, m, true);
         float* o = gates_;
         static const int cmin = env_int("FLASH_DN_CHUNK", 64);  // 0: sequential
-        if (cmin > 0 && m >= cmin) {  // chunked (WY) delta rule on tensor cores (dn_chunk.cu of the 27B engine)
+        if (cmin > 0 && m >= cmin && ::dn_chunk_supported()) {  // chunked (WY) delta rule on tensor cores (dn_chunk.cu of the 27B engine)
             // rows of a previous forward still pending: commit them first (m = 0: commit + state write only)
             k_dn_rec_d<<<dim3(vl, 16), 128, 0, st_>>>(cv, ch, kl, vl, p_.k0, p_.v0, proj2_, L.A, L.dtb, L.S, L.rec_pend,
                                                        posd_ + 1, stepc_, o, 0, true);
@@ -4240,6 +4261,11 @@ void Worker::qd_kv1_decide() {
     if (qd_kv1_ >= 0) return;
     int same = 0;
     for (int g = 0; g < p_.ngpu; g++) same += comm_.dev[g] == dev_;
+    if (QD_SMEM > smem_limit_) {
+        qd_kv1_ = 1;
+        if (p_.rank == 0) fprintf(stderr, "[flash] KV1 attention layout required by the device shared memory limit\n");
+        return;
+    }
     qd_kv1_ = env_int("FLASH_QD_KV1", 1) != 0 && same == 1;
     if (p_.rank == 0 || same > 1) {
         int nb = 0;
@@ -4426,7 +4452,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 static const bool itc = env_int("FLASH_IDX_TC", 1);
                 if (itc && pf_ && ist)
                     k_idx_score_mma<<<dim3((lbmax + IT_BLK - 1) / IT_BLK, (mr + IT_ROWS - 1) / IT_ROWS), 256, IT_SMEM, st_>>>(L.ikb, iq, pp, p_, lbmax, mr, iscore_, rbcur_);
-                else if (ist && mr > 8)  // rows x blocks tiles: keys read once per 16 rows
+                else if (ist && mr > 8 && IS_SMEM <= smem_limit_)  // rows x blocks tiles: keys read once per 16 rows
                     k_idx_score_t<<<dim3((lbmax + IS_BLK - 1) / IS_BLK, (mr + IS_ROWS - 1) / IS_ROWS), 256, IS_SMEM, st_>>>(L.ikb, iq, pp, p_, lbmax, mr, iscore_, rbcur_);
                 else
                 k_idx_score<<<dim3((lbmax + 255) / 256, mr), 256, 0, st_>>>(L.ikb, iq, pp, p_, lbmax, iscore_, nullptr, rbcur_);
@@ -4486,7 +4512,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
             static const bool tc_k = env_int("FLASH_ATTN_TC", 1);
             if (tc_k && !sel_on_ && mr > 8 && !dinv) {  // prefill chunk without block selection: tensor cores
                 static const int tcv = env_int("FLASH_ATTN_TC", 2);
-                if (tcv == 2) {  // 2 heads x 32 rows per block, fast fp8 widening, Q in registers
+                if (tcv == 2 || TA_SMEM > smem_limit_) {  // 2 heads x 32 rows per block, fast fp8 widening, Q in registers
                     AttnDst d{};
                     d.o[0] = attn_x_;
                     auto tf = kv4_ ? (x16 ? k_qsa_attn_tc2<2, true, true> : k_qsa_attn_tc2<2, false, true>)
@@ -4515,10 +4541,11 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 // default, but no faster: CE prefill is bound by the exchanges (16K -0.6 %, 100K +0.7 %), so it stays off
                 static const bool qpf_ce_on = env_int("FLASH_QPF_CE", 0);
                 const bool ce_x = xstage_ && comm_.xfer == kXferCE;
-                if (pfsel && !pfdec_ && pf_ && sel_on_ && mr > MAXM && std::min(pfs, attn_split_) >= 1 && (!ce_x || qpf_ce_on)) {
+                const size_t pfsel_smem = qpf_smem(lbmax);
+                if (pfsel_smem <= smem_limit_ && pfsel && !pfdec_ && pf_ && sel_on_ && mr > MAXM && std::min(pfs, attn_split_) >= 1 && (!ce_x || qpf_ce_on)) {
                     const int S = std::min(pfs, attn_split_);
                     for (int z = 1; z < S; z++) d.o[z] = attn_spl_ + (size_t)(z - 1) * XROWS * NQ * (HD + 2);
-                    const size_t smem = qpf_smem(lbmax);
+                    const size_t smem = pfsel_smem;
                     static const int hv0 = env_int("FLASH_QPF_H", 3);  // bit 0: fp16 P.V, bit 1: fp16 Q.K
                     const int hv = kv4_ && !kv4_qkh_ok_ ? hv0 & 1 : hv0;  // (4-bit: fp16 Q.K only under its bound, alloc_state)
                     auto kf = kv4_ ? (hv == 3 ? k_qsa_pfsel<true, true, true> : hv == 2 ? k_qsa_pfsel<false, true, true> : hv == 1 ? k_qsa_pfsel<true, false, true> : k_qsa_pfsel<false, false, true>)
@@ -4573,15 +4600,15 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 // Off when another rank of this TP group shares the card (TP4 on 3 cards): KV1 blocks spin on the peers'
                 // q flags and take every SM's registers, so the same-card peer's q producer could not run (review M1).
                 qd_kv1_decide();
-                const bool kv1 = qd_kv1_ && (mr > MAXM || kv1_dec(mr));
+                const bool kv1 = QD_SMEM > smem_limit_ || (qd_kv1_ && (mr > MAXM || kv1_dec(mr)));
                 auto qdf = kv4_ ? (kv1 ? k_qsa_dec<true, 0, true> : k_qsa_dec<false, 0, true>) : kv1 ? k_qsa_dec<true> : k_qsa_dec<false>;
                 qdf<<<dim3(NKV, mr, S), 128, kv1 ? QD_SMEM1 : QD_SMEM, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, d, p_, xq,
                                                                         sel_on_ ? isel_ : nullptr, insel_, lbmax, nullptr, rbcur_, q16, kvmap(L),
                                                                         kvs_ && mr <= MAXM ? psel_ : nullptr, mr <= MAXM ? qd_mint(mr, S) : 0);
                 if (S > 1) k_attn_merge<<<dim3(NQ, mr), HD, 0, st_>>>(d, S);
                 static const bool qcmp = env_int("FLASH_QPF_CMP", 0);
-                if (qcmp && !kv4_ && pf_ && sel_on_ && mr > MAXM && attnB_ && S == 1) {  // debug: k_qsa_pfsel shadow vs k_qsa_dec (eager)
-                    const size_t smem = qpf_smem(lbmax);
+                if (pfsel_smem <= smem_limit_ && qcmp && !kv4_ && pf_ && sel_on_ && mr > MAXM && attnB_ && S == 1) {  // debug: k_qsa_pfsel shadow vs k_qsa_dec (eager)
+                    const size_t smem = pfsel_smem;
                     CUDA_CHECK(cudaFuncSetAttribute(k_qsa_pfsel<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
                     AttnDst d2{};
                     d2.o[0] = attnB_;
@@ -6046,8 +6073,14 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
                 hc_rows(*next, Rb + (size_t)o0 * RW, injb + (size_t)o0 * HC, agq_x_, xho, nr, ps);
                 k_xh_to_x<<<64, 256, 0, ps>>>(xho, agq_x_, (size_t)nr * H / 2);
                 k_x_to_r8<<<nr, H / 16, 0, ps>>>(agq_x_, H, H, agq_r8_, agq_r8s_);
-                k_rows_q<<<dim3((nr + RQ_TB - 1) / RQ_TB, (ml->router8.n + RQ_NB - 1) / RQ_NB), 256, RQ_SMEM, ps>>>(
-                    ml->router8.q, ml->router8.s, H, ml->router8.n, agq_r8_, agq_r8s_, agq_rlog_, 528, nr);
+                const int tb = (nr + RQ_TB - 1) / RQ_TB;
+                const W8& router = ml->router8;
+                if (RQ_SMEM > smem_limit_)
+                    k_rows_qt<3, 2><<<dim3(tb, (router.n + 95) / 96), 256, rq_smem<3, 2>(), ps>>>(
+                        router.q, router.s, H, router.n, agq_r8_, agq_r8s_, agq_rlog_, 528, nr);
+                else
+                    k_rows_q<<<dim3(tb, (router.n + RQ_NB - 1) / RQ_NB), 256, RQ_SMEM, ps>>>(
+                        router.q, router.s, H, router.n, agq_r8_, agq_r8s_, agq_rlog_, 528, nr);
                 k_topk_rows<<<nr, NE, 0, ps>>>(agq_rlog_, 1, gsel_ + (size_t)o0 * TOPK, gw_ + (size_t)o0 * TOPK, gsh_ + o0, nullptr, nr);
                 int8_t* const xq = reinterpret_cast<int8_t*>(xho);
                 k_xh_to_q<64><<<nr, 160, 0, ps>>>(xho, xq, reinterpret_cast<float2*>(xq + H));

@@ -1,3 +1,4 @@
+#include "kernels/cuda_compat.cuh"
 #include <atomic>
 #include <climits>
 #include "../env.h"
@@ -1398,6 +1399,7 @@ constexpr size_t kAttnSmem =
 
 void attention_init() {
     attention_decode_tc_init();
+    if (kAttnSmem > size_t(qe_shared_memory_limit())) return;
     CUDA_CHECK(cudaFuncSetAttribute(attn_split_kernel<8>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kAttnSmem));
     CUDA_CHECK(cudaFuncSetAttribute(attn_split_kernel<16>,
@@ -1416,7 +1418,8 @@ void attention(const bf16* q, const void* kc_, const void* vc_, const AttnShape&
     int G = 0;
     for (int k = 0; k < s.nkv; k++) G = std::max(G, (s.kv_qe[k] - s.kv_qb[k]) * m);
     CHECK(G <= kMaxGroup, "attention group too large");
-    static const bool use_cuda_cores = env_int("QE_ATTN_CC", 0);
+    static const bool use_cuda_cores_env = env_int("QE_ATTN_CC", 0);
+    const bool use_cuda_cores = use_cuda_cores_env && kAttnSmem <= size_t(qe_shared_memory_limit());
     CHECK(!use_cuda_cores || s.fp8 || s.split == 0, "the CUDA-core attention has no shared-prefix path");
     const dim3 grid(s.nkv, kAttnSplits);
     for (int j = 0; j < s.nkv; j++)
@@ -1744,10 +1747,10 @@ static bool dn_core2_seg(const DnSegs& g, const float* cv, int ch, const DeltaSh
 // idling between the load and compute phases of a wave.
 __device__ __forceinline__ void cpa4(float* sdst, const float* gsrc) {
     const unsigned sa = (unsigned)__cvta_generic_to_shared(sdst);
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(sa), "l"(gsrc));
+    qe::cuda_compat::copy_to_shared<4>(sa, gsrc);
 }
-__device__ __forceinline__ void cpa_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-__device__ __forceinline__ void cpa_wait1() { asm volatile("cp.async.wait_group 1;\n" ::); }
+__device__ __forceinline__ void cpa_commit() { qe::cuda_compat::copy_commit(); }
+__device__ __forceinline__ void cpa_wait1() { qe::cuda_compat::copy_wait<1>(); }
 
 // KS: shared-memory stride of a lane's 16 k / q entries (16 dense; 20: [q27-dn-core3-pad] no 4-way bank conflict on the
 // 128-bit loads; same values, same order)

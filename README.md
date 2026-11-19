@@ -89,6 +89,8 @@ Older releases and what changed in each: [releases page](https://github.com/bpx0
 
 More settings, measurements and the troubleshooting table: [docs/advanced.md](docs/advanced.md).
 
+The `cmp50-sm75` branch has an [experimental Turing build](docs/sm75.md) for CMP 50HX.
+
 ## Quick start
 
 You need Linux, two or three RTX 3000, 4000 or 5000 series cards (see [Hardware](#hardware-and-interconnect)), an

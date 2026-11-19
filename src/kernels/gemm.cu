@@ -2,6 +2,7 @@
 // Weights use the same fragment-packed layouts as the GEMV path (gemv.cuh), so the A operand
 // (weights) streams straight from global memory into registers, while token activations are
 // staged through shared memory with cp.async and read as B fragments with ldmatrix.
+#include "kernels/cuda_compat.cuh"
 #include "../env.h"
 #include <cerrno>
 #include <cstring>
@@ -31,17 +32,17 @@ template <int WT> constexpr int block_rows() { return 32 * (8 / WT); }
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool pred) {
     const unsigned s = __cvta_generic_to_shared(smem);
     const int n = pred ? 16 : 0;
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(s), "l"(gmem), "r"(n));
+    qe::cuda_compat::copy_to_shared<16>(s, gmem, n);
 }
 __device__ __forceinline__ void cp_async8(void* smem, const void* gmem, bool pred) {
     const unsigned s = __cvta_generic_to_shared(smem);
     const int n = pred ? 8 : 0;
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::"r"(s), "l"(gmem), "r"(n));
+    qe::cuda_compat::copy_to_shared<8>(s, gmem, n);
 }
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
+__device__ __forceinline__ void cp_async_commit() { qe::cuda_compat::copy_commit(); }
 template <int N>
 __device__ __forceinline__ void cp_async_wait() {
-    asm volatile("cp.async.wait_group %0;" ::"n"(N));
+    qe::cuda_compat::copy_wait<N>();
 }
 
 __device__ __forceinline__ void ldmatrix_x4(uint32_t r[4], const void* smem) {
@@ -52,11 +53,7 @@ __device__ __forceinline__ void ldmatrix_x4(uint32_t r[4], const void* smem) {
 }
 
 __device__ __forceinline__ void mma_bf16(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-        "{%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_bf16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 
 // X tile in shared memory: [BT tokens][BK k] bf16, 128-byte rows, 16-byte chunks XOR-swizzled
@@ -240,11 +237,7 @@ __global__ void __launch_bounds__(kThreads) gemm_kernel(const uint4* __restrict_
 // fp16 partial is scaled by the weight group scale and added to fp32 accumulators; the token
 // scale is applied in the epilogue.
 __device__ __forceinline__ void mma_h16(uint32_t c[2], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, "
-        "{%0,%1};"
-        : "+r"(c[0]), "+r"(c[1])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_fp16_packed(c[0], c[1], a[0], a[1], a[2], a[3], b0, b1);
 }
 
 __device__ __forceinline__ void dequant_int_h(uint32_t q, uint32_t a[4]) {
@@ -475,20 +468,16 @@ constexpr float kMagic = 12582912.f;       // 1.5 * 2^23
 constexpr uint32_t kMagicBits = 0x4B400000u;
 
 __device__ __forceinline__ void mma_s8(uint32_t c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-        "{%8,%9}, {%0,%1,%2,%3};"
-        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_int8<false>(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 // first step of a group: C operand = the magic constant (no accumulator zeroing)
 __device__ __forceinline__ void mma_s8_init(uint32_t c[4], const uint32_t a[4], uint32_t b0,
                                             uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-        "{%8,%9}, {%10,%10,%10,%10};"
-        : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(kMagicBits));
+    c[0] = kMagicBits;
+    c[1] = kMagicBits;
+    c[2] = kMagicBits;
+    c[3] = kMagicBits;
+    qe::cuda_compat::mma_int8<false>(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 
 // 4 nibbles (u = w + 8, even or odd positions of q) -> 4 signed int8 bytes (w)
@@ -941,20 +930,16 @@ __global__ void __launch_bounds__(kThreads) gemm_i8_kernel(const uint4* __restri
 //   next instead of serialising on a per-tile accumulator (the old kernel's 57 % tensor pipe).
 // Warp tile: (TB / WT) tokens x 32 rows; block: 8 warps = (8 / WT) row groups x WT token groups.
 __device__ __forceinline__ void mma_s8u8(uint32_t c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.u8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-        "{%8,%9}, {%0,%1,%2,%3};"
-        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_int8<true>(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 // first step of a sub-group: C = the record constants of tokens g (c0, c1) and g + 8 (c2, c3)
 __device__ __forceinline__ void mma_s8u8_init(uint32_t c[4], const uint32_t a[4], uint32_t b0,
                                               uint32_t b1, uint32_t cg, uint32_t cg8) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.u8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-        "{%8,%9}, {%10,%10,%11,%11};"
-        : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(cg), "r"(cg8));
+    c[0] = cg;
+    c[1] = cg;
+    c[2] = cg8;
+    c[3] = cg8;
+    qe::cuda_compat::mma_int8<true>(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 
 // NWB: weight stage buffers (issued NWB - 1 stages ahead); the scale rows have NWB + 1 buffers
@@ -1324,12 +1309,11 @@ __global__ void __launch_bounds__(kThreads, MINB) gemm_i8t_kernel(const uint4* _
 
 // init step with the C quad of the record (4 distinct PTX registers: ptxas uses the LDS.128 quad)
 __device__ __forceinline__ void mma_s8u8_initq(uint32_t c[4], const uint32_t a[4], uint32_t b0, uint32_t b1, const float4 q) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.u8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-        "{%8,%9}, {%10,%11,%12,%13};"
-        : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(__float_as_uint(q.x)),
-          "r"(__float_as_uint(q.y)), "r"(__float_as_uint(q.z)), "r"(__float_as_uint(q.w)));
+    c[0] = __float_as_uint(q.x);
+    c[1] = __float_as_uint(q.y);
+    c[2] = __float_as_uint(q.z);
+    c[3] = __float_as_uint(q.w);
+    qe::cuda_compat::mma_int8<true>(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 
 template <uint32_t M> __device__ __forceinline__ uint32_t and_v(uint32_t a) {
@@ -1354,11 +1338,11 @@ template <uint32_t M, uint32_t X> __device__ __forceinline__ uint32_t andxor_v(u
     return r;
 }
 __device__ __forceinline__ void mma_s8s8_initq(uint32_t c[4], const uint32_t a[4], uint32_t b0, uint32_t b1, const uint4 q) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-        "{%8,%9}, {%10,%11,%12,%13};"
-        : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(q.x), "r"(q.y), "r"(q.z), "r"(q.w));
+    c[0] = q.x;
+    c[1] = q.y;
+    c[2] = q.z;
+    c[3] = q.w;
+    qe::cuda_compat::mma_int8<false>(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 // x tile rows of 144 B (128 B + 16 B pad): ldmatrix rows of a matrix land in 8 distinct 16-B bank
 // groups without an XOR swizzle, so every per-step offset is an immediate
@@ -1587,13 +1571,12 @@ __global__ void __launch_bounds__(kThreads, MINB) gemm_i8v_kernel(const uint4* _
                 const unsigned par = ((kx / NST) + 1) & 1;
                 uint32_t ok;
                 do {
-                    asm volatile("{ .reg .pred p; mbarrier.test_wait.parity.shared.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
-                                 : "=r"(ok) : "r"(eb), "r"(par) : "memory");
+                    ok = qe::cuda_compat::barrier_ready(eb, par);
                     if (NSL && !ok) __nanosleep(NSL);
                 } while (!ok);
             }
             const unsigned d = sm0 + stage * XST + (idx >> 3) * kXRow + (idx & 7) * 16;
-            if (!(AB & 128)) asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(d), "l"(xg[i]), "r"(xok[i] ? 16 : 0));
+            if (!(AB & 128)) qe::cuda_compat::copy_to_shared<16>(d, xg[i], xok[i] ? 16 : 0);
             xg[i] += BKI;
         }
 #pragma unroll
@@ -1601,30 +1584,30 @@ __global__ void __launch_bounds__(kThreads, MINB) gemm_i8v_kernel(const uint4* _
             const int idx = tid + i * kThreads;
             if ((TB / 16) * BLK % kThreads == 0 || idx < (TB / 16) * BLK) {
                 const unsigned d = srec0 + stage * RST + idx * 16;
-                if (!(AB & 128)) asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(d), "l"(rg[i]), "r"(rok[i] ? 16 : 0));
+                if (!(AB & 128)) qe::cuda_compat::copy_to_shared<16>(d, rg[i], rok[i] ? 16 : 0);
             }
             rg[i] += BLK;
         }
         if constexpr (WSM) {  // this lane's 4 packed weight words of the stage (row tiles rt0, rt0 + 1, 2 chunks)
             const unsigned d = wsm0 + ((stage * 8 + warp) * 4 * 32 + lane) * 16;
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 16;" ::"r"(d), "l"(wg0));
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 16;" ::"r"(d + 32 * 16), "l"(wg0 + 32));
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 16;" ::"r"(d + 2 * 32 * 16), "l"(wg1));
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 16;" ::"r"(d + 3 * 32 * 16), "l"(wg1 + 32));
+            qe::cuda_compat::copy_to_shared<16>(d, wg0);
+            qe::cuda_compat::copy_to_shared<16>(d + 32 * 16, wg0 + 32);
+            qe::cuda_compat::copy_to_shared<16>(d + 2 * 32 * 16, wg1);
+            qe::cuda_compat::copy_to_shared<16>(d + 3 * 32 * 16, wg1 + 32);
             wg0 += 64;
             wg1 += 64;
         }
         if constexpr (CS2) {  // weight-scale rows of the same stage (ring by global stage)
             if (wt == 0 && lane < 4) {
                 const unsigned d = ssm0 + ((kx & 3) * 8 + wr) * 64 + lane * 16;
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 16;" ::"r"(d), "l"(sg));
+                qe::cuda_compat::copy_to_shared<16>(d, sg);
             }
             sg += 16;
             xs_left--;
         }
         if constexpr (MB) {
             const unsigned fb = mb0 + stage * 8;  // full[stage]: completes when every thread's copies landed
-            asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];" ::"r"(fb));
+            qe::cuda_compat::barrier_arrive_after_copy(fb);
         }
         kx++;
     };
@@ -1632,7 +1615,7 @@ __global__ void __launch_bounds__(kThreads, MINB) gemm_i8v_kernel(const uint4* _
         if constexpr (CS2) return;  // (part of the load stream)
         if (wt == 0 && lane < 4) {
             const unsigned d = ssm0 + ((kw & 3) * 8 + wr) * 64 + lane * 16;  // ring by global stage
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 16;" ::"r"(d), "l"(sg));
+            qe::cuda_compat::copy_to_shared<16>(d, sg);
         }
         sg += 16;
         kw++;
@@ -1708,8 +1691,8 @@ __global__ void __launch_bounds__(kThreads, MINB) gemm_i8v_kernel(const uint4* _
     };
     if (MB && tid == 0)
         for (int b = 0; b < NST; b++) {
-            asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(mb0 + b * 8), "r"(kThreads));
-            asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(mb0 + NST * 8 + b * 8), "r"(8));
+            qe::cuda_compat::barrier_init(mb0 + b * 8, kThreads);
+            qe::cuda_compat::barrier_init(mb0 + NST * 8 + b * 8, 8);
         }
     int gsc = 0;  // global count of consumed stages (buffer gsc % NST, phase gsc / NST)
     bool first = true;
@@ -1791,8 +1774,7 @@ __global__ void __launch_bounds__(kThreads, MINB) gemm_i8v_kernel(const uint4* _
                 const unsigned fb = mb0 + stage * 8, par = (gsc / NST) & 1;
                 uint32_t ok;
                 do {
-                    asm volatile("{ .reg .pred p; mbarrier.test_wait.parity.shared.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
-                                 : "=r"(ok) : "r"(fb), "r"(par) : "memory");
+                    ok = qe::cuda_compat::barrier_ready(fb, par);
                     if (NSL && !ok) __nanosleep(NSL);
                 } while (!ok);
             } else {
@@ -1986,8 +1968,7 @@ __global__ void __launch_bounds__(kThreads, MINB) gemm_i8v_kernel(const uint4* _
             if constexpr (MB) {  // this warp is done with the stage's buffer
                 __syncwarp();
                 if (lane == 0) {
-                    uint64_t st;
-                    asm volatile("mbarrier.arrive.shared.b64 %0, [%1];" : "=l"(st) : "r"(mb0 + NST * 8 + stage * 8) : "memory");
+                    qe::cuda_compat::barrier_arrive(mb0 + NST * 8 + stage * 8);
                 }
             }
             gsc++;
@@ -2338,15 +2319,14 @@ __global__ void __launch_bounds__(kThreads, MINB) gemm_i8c_kernel(const uint4* _
             const unsigned eb = mb0 + NST * 8 + stage * 8, par = ((gx / NST) + 1) & 1;
             uint32_t ok;
             do {
-                asm volatile("{ .reg .pred p; mbarrier.test_wait.parity.shared.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
-                             : "=r"(ok) : "r"(eb), "r"(par) : "memory");
+                ok = qe::cuda_compat::barrier_ready(eb, par);
             } while (!ok);
         }
 #pragma unroll
         for (int i = 0; i < NXI; i++) {
             const int idx = tid + i * kThreads;
             const unsigned d = sm0 + stage * XST + (idx >> 3) * kXRow + (idx & 7) * 16;
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(d), "l"(xg[i]), "r"(xok[i] ? 16 : 0));
+            qe::cuda_compat::copy_to_shared<16>(d, xg[i], xok[i] ? 16 : 0);
             xg[i] += BKI;
         }
 #pragma unroll
@@ -2354,11 +2334,11 @@ __global__ void __launch_bounds__(kThreads, MINB) gemm_i8c_kernel(const uint4* _
             const int idx = tid + i * kThreads;
             if ((TB / 16) * BLK % kThreads == 0 || idx < (TB / 16) * BLK) {
                 const unsigned d = srec0 + stage * RST + idx * 16;
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(d), "l"(rg[i]), "r"(rok[i] ? 16 : 0));
+                qe::cuda_compat::copy_to_shared<16>(d, rg[i], rok[i] ? 16 : 0);
             }
             rg[i] += BLK;
         }
-        asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];" ::"r"(mb0 + stage * 8));
+        qe::cuda_compat::barrier_arrive_after_copy(mb0 + stage * 8);
         gx++;
     };
     // ---- W stream (weight-scale rows), threads wthr; ring of 4 by global stage
@@ -2376,7 +2356,7 @@ __global__ void __launch_bounds__(kThreads, MINB) gemm_i8c_kernel(const uint4* _
         }
         if (wdone) return;
         const unsigned d = ssm0 + ((gw & 3) * 8 + wr) * 64 + lane * 16;
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 16;" ::"r"(d), "l"(sg));
+        qe::cuda_compat::copy_to_shared<16>(d, sg);
         sg += 16;
         gw++;
     };
@@ -2408,8 +2388,8 @@ __global__ void __launch_bounds__(kThreads, MINB) gemm_i8c_kernel(const uint4* _
     if (tid == 0) {
         *mq_s = make_uint4(kMagicBits, kMagicBits, kMagicBits, kMagicBits);
         for (int b = 0; b < NST; b++) {
-            asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(mb0 + b * 8), "r"(kThreads));
-            asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(mb0 + NST * 8 + b * 8), "r"(8));
+            qe::cuda_compat::barrier_init(mb0 + b * 8, kThreads);
+            qe::cuda_compat::barrier_init(mb0 + NST * 8 + b * 8, 8);
         }
         int* ring = reinterpret_cast<int*>(smb + (us0 - sm0));
         for (int i = 0; i < 8; i++) ring[i] = 0;
@@ -2465,8 +2445,7 @@ __global__ void __launch_bounds__(kThreads, MINB) gemm_i8c_kernel(const uint4* _
                 const unsigned fb = mb0 + stage * 8, par = (gc / NST) & 1;
                 uint32_t ok;
                 do {
-                    asm volatile("{ .reg .pred p; mbarrier.test_wait.parity.shared.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
-                                 : "=r"(ok) : "r"(fb), "r"(par) : "memory");
+                    ok = qe::cuda_compat::barrier_ready(fb, par);
                 } while (!ok);
             }
             load_w();  // stage gc + NWB - 1 (any unit)
@@ -2528,8 +2507,7 @@ __global__ void __launch_bounds__(kThreads, MINB) gemm_i8c_kernel(const uint4* _
             }
             __syncwarp();
             if (lane == 0) {
-                uint64_t st;
-                asm volatile("mbarrier.arrive.shared.b64 %0, [%1];" : "=l"(st) : "r"(mb0 + NST * 8 + stage * 8) : "memory");
+                qe::cuda_compat::barrier_arrive(mb0 + NST * 8 + stage * 8);
             }
         }
         if (d.nk > 0) flush(MT - 1, cc[1], rec[1], sw);
@@ -2582,7 +2560,7 @@ __global__ void __launch_bounds__(kThreads, MINB) gemm_i8c_kernel(const uint4* _
             }
         }
     }
-    asm volatile("cp.async.wait_all;" ::: "memory");  // (no copies are issued past the last unit)
+    qe::cuda_compat::copy_wait_all();  // (no copies are issued past the last unit)
 }
 
 // ---------------------------------------------------------------- W4A8, 16 warps of 16 rows (4 warps per scheduler)
@@ -2689,8 +2667,7 @@ __global__ void __launch_bounds__(kWThreads, 1) gemm_i8w_kernel(const uint4* __r
             const unsigned eb = mb0 + NST * 8 + stage * 8, par = ((kx / NST) + 1) & 1;
             uint32_t ok;
             do {
-                asm volatile("{ .reg .pred p; mbarrier.test_wait.parity.shared.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
-                             : "=r"(ok) : "r"(eb), "r"(par) : "memory");
+                ok = qe::cuda_compat::barrier_ready(eb, par);
             } while (!ok);
         }
 #pragma unroll
@@ -2698,7 +2675,7 @@ __global__ void __launch_bounds__(kWThreads, 1) gemm_i8w_kernel(const uint4* __r
             const int idx = tid + i * kWThreads;
             if ((TB * 8) % kWThreads == 0 || idx < TB * 8) {
                 const unsigned d = sm0 + stage * XST + (idx >> 3) * kXRow + (idx & 7) * 16;
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(d), "l"(xg[i]), "r"(xok[i] ? 16 : 0));
+                qe::cuda_compat::copy_to_shared<16>(d, xg[i], xok[i] ? 16 : 0);
             }
             xg[i] += BKI;
         }
@@ -2707,17 +2684,17 @@ __global__ void __launch_bounds__(kWThreads, 1) gemm_i8w_kernel(const uint4* __r
             const int idx = tid + i * kWThreads;
             if ((TB / 16) * BLK % kWThreads == 0 || idx < (TB / 16) * BLK) {
                 const unsigned d = srec0 + stage * RST + idx * 16;
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(d), "l"(rg[i]), "r"(rok[i] ? 16 : 0));
+                qe::cuda_compat::copy_to_shared<16>(d, rg[i], rok[i] ? 16 : 0);
             }
             rg[i] += BLK;
         }
-        if constexpr (MB) asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];" ::"r"(mb0 + stage * 8));
+        if constexpr (MB) qe::cuda_compat::barrier_arrive_after_copy(mb0 + stage * 8);
         kx++;
     };
     auto load_w = [&]() {  // weight-scale row (2 x 16 B per warp) of stage kw
         if (lane < 2) {
             const unsigned d = ssm0 + ((kw & 3) * 16 + warp) * 32 + lane * 16;
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 16;" ::"r"(d), "l"(sg));
+            qe::cuda_compat::copy_to_shared<16>(d, sg);
         }
         sg += 16;
         kw++;
@@ -2741,8 +2718,8 @@ __global__ void __launch_bounds__(kWThreads, 1) gemm_i8w_kernel(const uint4* __r
     if (HS && tid == 0) *mq_s = make_uint4(kMagicBits, kMagicBits, kMagicBits, kMagicBits);
     if (MB && tid == 0)
         for (int b = 0; b < NST; b++) {
-            asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(mb0 + b * 8), "r"(kWThreads));
-            asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(mb0 + NST * 8 + b * 8), "r"(16));
+            qe::cuda_compat::barrier_init(mb0 + b * 8, kWThreads);
+            qe::cuda_compat::barrier_init(mb0 + NST * 8 + b * 8, 16);
         }
     int gsc = 0;
     bool first = true;
@@ -2792,8 +2769,7 @@ __global__ void __launch_bounds__(kWThreads, 1) gemm_i8w_kernel(const uint4* __r
                 const unsigned fb = mb0 + stage * 8, par = (gsc / NST) & 1;
                 uint32_t ok;
                 do {
-                    asm volatile("{ .reg .pred p; mbarrier.test_wait.parity.shared.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
-                                 : "=r"(ok) : "r"(fb), "r"(par) : "memory");
+                    ok = qe::cuda_compat::barrier_ready(fb, par);
                 } while (!ok);
             } else {
                 cp_async_wait<NST - 2>();
@@ -2885,8 +2861,7 @@ __global__ void __launch_bounds__(kWThreads, 1) gemm_i8w_kernel(const uint4* __r
             if constexpr (MB) {
                 __syncwarp();
                 if (lane == 0) {
-                    uint64_t st;
-                    asm volatile("mbarrier.arrive.shared.b64 %0, [%1];" : "=l"(st) : "r"(mb0 + NST * 8 + stage * 8) : "memory");
+                    qe::cuda_compat::barrier_arrive(mb0 + NST * 8 + stage * 8);
                 }
             }
             gsc++;
@@ -3667,12 +3642,22 @@ void gemm_i8_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, 
                                                           VF >= 2 && VF <= 4 && tl_out16 && !w.glu);
     }
 }
+template <int TB, int WT>
+void gemm_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, int ks, cudaStream_t st);
+
 // W8A8 GEMM of a Q8 matrix (INT8 checkpoint): gemm_i8_kernel<..., Q8> after its own pre-pass (x_to_i8_old_kernel:
 // {sx, -M sx} records). Persistent stream-K as the W4A8 kernels; the weight double buffer is 2 x 32 KB, so TB <= 64.
 // The producers' W4A8 prequantization is off for Q8 models (gemm_q8_model), the GLU epilogue writes bf16 as usual.
 template <int TB, int WT, int G>
 void gemm_q8_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cudaStream_t st) {
     static_assert(TB <= 64, "Q8 W8A8 smem");
+    constexpr size_t smem = (size_t)STAGES * TB * (128 + 8 * (G == 128 ? 2 : 128 / G)) + 2 * kThreads * 128 + 2 * 8 * 64;
+    static_assert(smem <= 99 * 1024, "Q8 W8A8 smem");
+    static thread_local const bool fits = smem <= size_t(qe_shared_memory_limit());
+    if (!fits) {
+        gemm_cfg<TB, WT>(w, x, ldx, c, ldc, t, 1, st);
+        return;
+    }
     const int rb = (w.n + block_rows<WT>() - 1) / block_rows<WT>(), tb = (t + TB - 1) / TB;
     const int nkt = w.k / BKI;
     const SkPlan pl = sk_plan(rb * tb, nkt);
@@ -3696,8 +3681,6 @@ void gemm_q8_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, 
     }
     tl_prequant.x = nullptr;  // (never registered for Q8 models; a stale entry must not reach a later W4 GEMM)
     x_to_i8_old_kernel<G><<<t, 256, 0, st>>>(x, ldx, w.k, tl_xq_buf.p, tl_xqs_buf.p, tl_sk_ctr_buf.p, 1);
-    constexpr size_t smem = (size_t)STAGES * TB * (128 + 8 * (G == 128 ? 2 : 128 / G)) + 2 * kThreads * 128 + 2 * 8 * 64;
-    static_assert(smem <= 99 * 1024, "Q8 W8A8 smem");
     static thread_local bool attr = false;  // per device (thread == device)
     if (!attr) {
         CUDA_CHECK(cudaFuncSetAttribute(gemm_i8_kernel<WT, TB, G, false, true>,

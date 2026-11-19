@@ -11,6 +11,7 @@
 // Numerics are those of every H16 kernel (gemv_h16.cuh): same slices (pick_warps, shape only), same
 // per-chunk fp16 mma chain and xh_flush, slices added in the same order as reduce_store_nt -> bit-identical
 // to gemv_w4h / gemv_w4hw / skinny_w4h for every m (batch == alone).
+#include "kernels/cuda_compat.cuh"
 #include "gemv.cuh"
 #include "gemv_h16.cuh"
 
@@ -24,11 +25,11 @@ __device__ __forceinline__ uint4 ldg_stream(const uint4* p) {
     return v;
 }
 __device__ __forceinline__ void cp_async16(unsigned smem, const void* gmem) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem), "l"(gmem));
+    qe::cuda_compat::copy_to_shared<16>(smem, gmem);
 }
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
+__device__ __forceinline__ void cp_async_commit() { qe::cuda_compat::copy_commit(); }
 template <int N>
-__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N)); }
+__device__ __forceinline__ void cp_async_wait() { qe::cuda_compat::copy_wait<N>(); }
 __device__ __forceinline__ float silu_f(float x) { return x / (1.f + __expf(-x)); }
 
 constexpr int kRowB = 144;  // 128 bytes of a chunk row + 16 padding (conflict-free 32-byte lane reads)
@@ -895,6 +896,7 @@ void gemv_x_init() {
     CUDA_CHECK(cudaMalloc(&g_red[dev], kRedFloats * 4));
     CUDA_CHECK(cudaMalloc(&g_ctr[dev], kMaxGroups * 4));
     CUDA_CHECK(cudaMemset(g_ctr[dev], 0, kMaxGroups * 4));
+    if (qe_shared_memory_limit() < 99 * 1024) return;  // only the per-tile kernel is used on this device
     set_attr<2>(); set_attr<3>(); set_attr<4>(); set_attr<5>(); set_attr<6>(); set_attr<7>(); set_attr<8>();
 }
 
@@ -918,7 +920,12 @@ bool gemv_w4hx(const W4& w, const __half* xh, int ldx, float* y, int ldy, int m,
     // out) the per-tile kernel (2), wider ones the staged one (0, S = 3); 25..32 rows (called from gemv_w4h
     // for >= 352 tiles): tile pairs (3).
     static const int mode_env = env_int("QE_W4HX_MODE", -1);
-    const int mode = mode_env >= 0 ? mode_env : m <= 32 ? 3 : tiles <= 320 ? 2 : 0;
+    const int limit = qe_shared_memory_limit();
+    int mode = mode_env >= 0 ? mode_env : m <= 32 ? 3 : tiles <= 320 ? 2 : 0;
+    if (limit < 99 * 1024) {
+        if (nw > 5) return false;
+        mode = 2;  // per tile, without dynamic shared memory
+    }
     const int s_env = env_int("QE_W4HX_S", mode_env < 0 ? 3 : 4);
     if (mode == 5) {  // one CTA per SM, whole K, TT tiles
         const int TT = (tiles + sm_count_x() - 1) / sm_count_x();

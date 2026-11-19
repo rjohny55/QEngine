@@ -1,6 +1,7 @@
 #pragma once
 // Flash-Next specific kernels (first version: correctness first, decode rows m <= MAXM processed together
 // where rows are independent and sequentially where they are not: conv / recurrent state / indexer tail).
+#include "kernels/cuda_compat.cuh"
 #include <cuda_fp8.h>
 #include <cassert>
 
@@ -292,8 +293,7 @@ __device__ __forceinline__ uint32_t s8x2_f16(uint32_t t) {
     return *reinterpret_cast<uint32_t*>(&h);
 }
 __device__ __forceinline__ void mma16(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_fp16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 __device__ __forceinline__ void a_from_w8(uint32_t lo, uint32_t hi, uint32_t a[4]) {
     a[0] = s8x2_f16(__byte_perm(lo, 0, 0x4140));
@@ -2274,11 +2274,11 @@ __global__ void __launch_bounds__(256) k_idx_score_mma(const bf16* __restrict__ 
         const int b = i >> 4, c = i & 15;
         const unsigned dst = (unsigned)__cvta_generic_to_shared(Ks + b * IT_SROW + c * 8);
         if (b0 + b < min(lbmax, nlbl))  // (live blocks only: no read past the tile's last visible block, review L1)
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(ikb + (size_t)(b0 + b) * IDX_HD + c * 8));
+            qe::cuda_compat::copy_to_shared<16>(dst, ikb + (size_t)(b0 + b) * IDX_HD + c * 8);
         else
             *reinterpret_cast<uint4*>(Ks + b * IT_SROW + c * 8) = make_uint4(0u, 0u, 0u, 0u);
     }
-    asm volatile("cp.async.commit_group;");
+    qe::cuda_compat::copy_commit();
     // q fragments while the keys land: q-rows g (row rr0 = g >> 2, head g & 3) and g + 8 (row 2 + (g >> 2))
     const int rw0 = r0 + 4 * warp;  // this warp's first row
     const int h = g & 3, ra = rw0 + (g >> 2), rb = rw0 + 2 + (g >> 2);
@@ -2296,7 +2296,7 @@ __global__ void __launch_bounds__(256) k_idx_score_mma(const bf16* __restrict__ 
             ah[kk][e] = bf2_pack(hx, hy);
             al[kk][e] = bf2_pack(v.x - hx, v.y - hy);
         }
-    asm volatile("cp.async.wait_group 0;");
+    qe::cuda_compat::copy_wait<0>();
     __syncthreads();
     const float rs = rsqrtf((float)IDX_HD);
     const int posa = *pos0 + ra, posb = *pos0 + rb;
@@ -2963,7 +2963,7 @@ __global__ void __launch_bounds__(128) k_qsa_attn_tc(const float* __restrict__ q
     const int r0 = warp * 16 + (lane >> 2), r1 = r0 + 8;
     const int nr0 = tb + r0 < m ? owned_upto(p, pos + tb + r0) : 0;
     const int nr1 = tb + r1 < m ? owned_upto(p, pos + tb + r1) : 0;
-    const int wmax = __reduce_max_sync(0xffffffffu, max(nr0, nr1));
+    const int wmax = qe::cuda_compat::warp_extreme<true>(max(nr0, nr1));
     float o[HD / 8][4];
 #pragma unroll
     for (int j = 0; j < HD / 8; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
@@ -3183,7 +3183,7 @@ __global__ void __launch_bounds__(64 * RG) k_qsa_attn_tc2(const float* __restric
     const int kend = owned_upto(p, pos + min(tb + 16 * RG, m) - 1);
     const int nr0 = tb + r0 < m ? owned_upto(p, pos + tb + r0) : 0;
     const int nr1 = tb + r1 < m ? owned_upto(p, pos + tb + r1) : 0;
-    const int wmax = __reduce_max_sync(0xffffffffu, max(nr0, nr1));
+    const int wmax = qe::cuda_compat::warp_extreme<true>(max(nr0, nr1));
     const int ntile = (kend + TB_KEYS - 1) / TB_KEYS, S = gridDim.z, z = blockIdx.z;
     const int tile0 = z * ntile / S, tile1 = (z + 1) * ntile / S;
     float o[HD / 8][4];
@@ -3212,16 +3212,16 @@ __global__ void __launch_bounds__(64 * RG) k_qsa_attn_tc2(const float* __restric
                 kv_rowp<true>(km, kc, vc, ks, vs, rb0, ok ? r : 0, kvh, k8, v8, s0, s1);
                 const unsigned sk = (unsigned)__cvta_generic_to_shared(Kr4 + key * (HD / 2) + ch * 16);
                 const unsigned sv = (unsigned)__cvta_generic_to_shared(Vr4 + key * (HD / 2) + ch * 16);
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sk), "l"(k8 + ch * 16), "r"(ok ? 16 : 0));
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sv), "l"(v8 + ch * 16), "r"(ok ? 16 : 0));
+                qe::cuda_compat::copy_to_shared<16>(sk, k8 + ch * 16, ok ? 16 : 0);
+                qe::cuda_compat::copy_to_shared<16>(sv, v8 + ch * 16, ok ? 16 : 0);
                 if (ch == 0) {
                     const unsigned a = (unsigned)__cvta_generic_to_shared(Ks4 + key * 8);
                     const unsigned b = (unsigned)__cvta_generic_to_shared(Vs4 + key * 8);
-                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(a), "l"(s0), "r"(ok ? 16 : 0));
-                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(b), "l"(s1), "r"(ok ? 16 : 0));
+                    qe::cuda_compat::copy_to_shared<16>(a, s0, ok ? 16 : 0);
+                    qe::cuda_compat::copy_to_shared<16>(b, s1, ok ? 16 : 0);
                 }
             }
-            asm volatile("cp.async.commit_group;");
+            qe::cuda_compat::copy_commit();
             return;
         }
         for (int c = threadIdx.x; c < TB_KEYS * (HD / 16); c += blockDim.x) {
@@ -3232,8 +3232,8 @@ __global__ void __launch_bounds__(64 * RG) k_qsa_attn_tc2(const float* __restric
             kv_rowp(km, kc, vc, ks, vs, rb0, ok ? r : 0, kvh, k8, v8, s0, s1);
             const unsigned sk = (unsigned)__cvta_generic_to_shared(Kr + key * HD + ch * 16);
             const unsigned sv = (unsigned)__cvta_generic_to_shared(Vr + key * HD + ch * 16);
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sk), "l"(k8 + ch * 16), "r"(ok ? 16 : 0));
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sv), "l"(v8 + ch * 16), "r"(ok ? 16 : 0));
+            qe::cuda_compat::copy_to_shared<16>(sk, k8 + ch * 16, ok ? 16 : 0);
+            qe::cuda_compat::copy_to_shared<16>(sv, v8 + ch * 16, ok ? 16 : 0);
         }
         if (threadIdx.x < TB_KEYS) {
             const int r = k0 + threadIdx.x;
@@ -3243,15 +3243,15 @@ __global__ void __launch_bounds__(64 * RG) k_qsa_attn_tc2(const float* __restric
             kv_rowp(km, kc, vc, ks, vs, rb0, ok ? r : 0, kvh, k8, v8, s0, s1);
             const unsigned a = (unsigned)__cvta_generic_to_shared(ksr + threadIdx.x);
             const unsigned b = (unsigned)__cvta_generic_to_shared(vsr + threadIdx.x);
-            asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(a), "l"(s0), "r"(ok ? 4 : 0));
-            asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(b), "l"(s1), "r"(ok ? 4 : 0));
+            qe::cuda_compat::copy_to_shared<4>(a, s0, ok ? 4 : 0);
+            qe::cuda_compat::copy_to_shared<4>(b, s1, ok ? 4 : 0);
         }
-        asm volatile("cp.async.commit_group;");
+        qe::cuda_compat::copy_commit();
     };
     if (tile0 < tile1) issue(tile0);
     for (int tile = tile0; tile < tile1; tile++) {
         const int k0 = tile * TB_KEYS;
-        asm volatile("cp.async.wait_group 0;");
+        qe::cuda_compat::copy_wait<0>();
         __syncthreads();  // staging complete; every warp is done with the previous fp16 tile
         if constexpr (K4) {
             for (int c = threadIdx.x; c < TB_KEYS * 8; c += blockDim.x) {  // (key, group of 32 dims)
@@ -3815,8 +3815,7 @@ __device__ __forceinline__ uint32_t bf2_to_h2(uint32_t v) {
     return *reinterpret_cast<const uint32_t*>(&h);
 }
 __device__ __forceinline__ void mma_bf(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_bf16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 template <bool W8M, int NT = 4, int NW = 4>
 __global__ void __launch_bounds__(NW * 32) k_rows_gemv(const uint4* __restrict__ wq, const bf16* __restrict__ ws, int K,
@@ -3914,10 +3913,9 @@ __global__ void __launch_bounds__(128) k_rows_gemm(const uint4* __restrict__ wq,
             const int r = i >> 4, c = i & 15, t = t0 + r;
             const bool ok = t < m;
             const unsigned sa = (unsigned)__cvta_generic_to_shared(&xs[buf][r][c * 8]);
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sa),
-                         "l"(x + (size_t)(ok ? t : t0) * ldx + ck * 128 + c * 8), "r"(ok ? 16 : 0));
+            qe::cuda_compat::copy_to_shared<16>(sa, x + (size_t)(ok ? t : t0) * ldx + ck * 128 + c * 8, ok ? 16 : 0);
         }
-        asm volatile("cp.async.commit_group;");
+        qe::cuda_compat::copy_commit();
     };
     float acc[NTT][4];
 #pragma unroll
@@ -3934,8 +3932,8 @@ __global__ void __launch_bounds__(128) k_rows_gemm(const uint4* __restrict__ wq,
 #pragma unroll
             for (int i = 0; i < 8; i++) w[i] = __ldg(wq + ((size_t)T * (K >> 4) + ck * 8 + i) * 32 + lane);
         }
-        if (ck + 1 < nchunk) { stage(ck + 1, buf ^ 1); asm volatile("cp.async.wait_group 1;"); }
-        else asm volatile("cp.async.wait_group 0;");
+        if (ck + 1 < nchunk) { stage(ck + 1, buf ^ 1); qe::cuda_compat::copy_wait<1>(); }
+        else qe::cuda_compat::copy_wait<0>();
         __syncthreads();
         float c[NTT][4];
 #pragma unroll
@@ -4144,7 +4142,7 @@ __global__ void __launch_bounds__(512) k_route2(const float* __restrict__ lg, in
         // per warp: top-10 by redux.sync max on order-preserving keys; ties -> lowest lane (= lowest index)
         unsigned key = fkey(x);
         for (int k = 0; k < TOPK; k++) {
-            const unsigned M = __reduce_max_sync(0xffffffffu, key);
+            const unsigned M = qe::cuda_compat::warp_extreme<true>(key);
             const unsigned b = __ballot_sync(0xffffffffu, key == M);
             const int l = __ffs(b) - 1;
             if (lane == l) key = 0u;
@@ -4163,8 +4161,8 @@ __global__ void __launch_bounds__(512) k_route2(const float* __restrict__ lg, in
 #pragma unroll
                 for (int j = 0; j < 5; j++)
                     if (lk[j] > bk || (lk[j] == bk && li[j] < bi)) { bk = lk[j]; bi = li[j]; }
-                const unsigned M = __reduce_max_sync(0xffffffffu, bk);
-                const int I = (int)__reduce_min_sync(0xffffffffu, bk == M ? (unsigned)bi : 0xffffffffu);
+                const unsigned M = qe::cuda_compat::warp_extreme<true>(bk);
+                const int I = (int)qe::cuda_compat::warp_extreme<false>(bk == M ? (unsigned)bi : 0xffffffffu);
 #pragma unroll
                 for (int j = 0; j < 5; j++) if (lk[j] == M && li[j] == I) lk[j] = 0u;
                 const float v = kfloat(M);
@@ -4247,7 +4245,7 @@ __global__ void __launch_bounds__(512) k_route3(const float* __restrict__ lg, in
     for (int sp = 0; sp < nsplit; sp++) x += lg[((size_t)sp * MAXM + t) * 528 + e];
     unsigned key = fkey(x);
     for (int k = 0; k < TOPK; k++) {
-        const unsigned M = __reduce_max_sync(0xffffffffu, key);
+        const unsigned M = qe::cuda_compat::warp_extreme<true>(key);
         const unsigned b = __ballot_sync(0xffffffffu, key == M);
         const int l = __ffs(b) - 1;
         if (lane == l) key = 0u;
@@ -4370,7 +4368,7 @@ __global__ void __launch_bounds__(512) k_topk_rows(const float* __restrict__ lg,
     // smem) compared by every thread (ties: lower index) - one barrier per round
     unsigned key = fkey(x);
     for (int k = 0; k < TOPK; k++) {
-        const unsigned M = __reduce_max_sync(0xffffffffu, key);
+        const unsigned M = qe::cuda_compat::warp_extreme<true>(key);
         const int l = __ffs(__ballot_sync(0xffffffffu, key == M)) - 1;
         if (lane == 0) { ck[(k & 1) * 16 + warp] = M; ci2[(k & 1) * 16 + warp] = warp * 32 + l; }
         __syncthreads();
@@ -4663,8 +4661,8 @@ __global__ void __launch_bounds__(512) k_route_f(const uint4* __restrict__ q, co
         float myv = 0.f, top = 0.f;
         int myi = 0;
         for (int k = 0; k < TOPK; k++) {
-            const unsigned M = __reduce_max_sync(0xffffffffu, lm);
-            const unsigned I = __reduce_min_sync(0xffffffffu, lm == M ? (unsigned)(lane + 32 * li) : 0xffffffffu);
+            const unsigned M = qe::cuda_compat::warp_extreme<true>(lm);
+            const unsigned I = qe::cuda_compat::warp_extreme<false>(lm == M ? (unsigned)(lane + 32 * li) : 0xffffffffu);
             if (k == 0) top = kfloat(M);
             if (lane == k) { myv = kfloat(M); myi = (int)I; }
             if (lane == (int)(I & 31)) {
@@ -5795,24 +5793,22 @@ __global__ void __launch_bounds__(256) k_hcu_pf2(const uint4* __restrict__ q, co
             const int r = i / (LOWRANK / 8), c8 = i % (LOWRANK / 8);
             const bool ok = r < m;
             const unsigned sa = (unsigned)__cvta_generic_to_shared(&hsb[buf][r][c8 * 8]);
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sa),
-                         "l"(hh + (size_t)(t0 + (ok ? r : 0)) * LOWRANK + c8 * 8), "r"(ok ? 16 : 0));
+            qe::cuda_compat::copy_to_shared<16>(sa, hh + (size_t)(t0 + (ok ? r : 0)) * LOWRANK + c8 * 8, ok ? 16 : 0);
         }
         if (tid < 8 * NT * HC) {
             const bool ok = tid / HC < m;
             const unsigned sa = (unsigned)__cvta_generic_to_shared(&rinvb[buf][tid / HC][tid % HC]);
-            asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(sa), "l"(rinvg + (size_t)t0 * HC + (ok ? tid : 0)),
-                         "r"(ok ? 4 : 0));
+            qe::cuda_compat::copy_to_shared<4>(sa, rinvg + (size_t)t0 * HC + (ok ? tid : 0), ok ? 4 : 0);
         }
-        asm volatile("cp.async.commit_group;");
+        qe::cuda_compat::copy_commit();
     };
     const int step = gridDim.y * 8 * NT;
     if (blockIdx.y * 8 * NT < C) stage(blockIdx.y * 8 * NT, 0);
     int buf = 0;
     for (int t0 = blockIdx.y * 8 * NT; t0 < C; t0 += step, buf ^= 1) {
         const int m = min(8 * NT, C - t0);
-        if (t0 + step < C) { stage(t0 + step, buf ^ 1); asm volatile("cp.async.wait_group 1;"); }
-        else asm volatile("cp.async.wait_group 0;");
+        if (t0 + step < C) { stage(t0 + step, buf ^ 1); qe::cuda_compat::copy_wait<1>(); }
+        else qe::cuda_compat::copy_wait<0>();
         __syncthreads();
         __half (*hs)[LOWRANK + 8] = hsb[buf];
         float (*rinv)[HC] = rinvb[buf];
@@ -6121,8 +6117,8 @@ __global__ void __launch_bounds__(256) k_moe_gu_pf2(const PfJob* __restrict__ jo
             const __half* xrow = x + (size_t)tl[pj.off + t0 + (st_r < m ? st_r : 0)] * H + st_p * 8;
             auto stage = [&](int ch, int b) {
                 const unsigned dst = (unsigned)__cvta_generic_to_shared(&xs[b][st_r][st_p * 8]);
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(xrow + (size_t)ch * 64));
-                asm volatile("cp.async.commit_group;");
+                qe::cuda_compat::copy_to_shared<16>(dst, xrow + (size_t)ch * 64);
+                qe::cuda_compat::copy_commit();
             };
             float acc[2][NT][4];
 #pragma unroll
@@ -6138,9 +6134,9 @@ __global__ void __launch_bounds__(256) k_moe_gu_pf2(const PfJob* __restrict__ jo
                     stage(ch + 1, b ^ 1);
                     wn0 = __ldg(qp0 + (size_t)(ch + 1) * 32);
                     wn1 = __ldg(qp1 + (size_t)(ch + 1) * 32);
-                    asm volatile("cp.async.wait_group 1;");
+                    qe::cuda_compat::copy_wait<1>();
                 } else {
-                    asm volatile("cp.async.wait_group 0;");
+                    qe::cuda_compat::copy_wait<0>();
                 }
                 __syncthreads();
                 const int gi = ch >> 1;

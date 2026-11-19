@@ -136,3 +136,9 @@ foreach(t comm_rule_unit xchg_seq_unit sample_rng_unit archive_order_unit pool_o
   endif()
 endforeach()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda_compat_unit.cu)
+  add_executable(cuda_compat_unit tests/cuda_compat_unit.cu)
+  target_include_directories(cuda_compat_unit PRIVATE src)
+  add_test(NAME cuda_compat_unit COMMAND cuda_compat_unit)
+  set_tests_properties(cuda_compat_unit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+endif()

@@ -13,6 +13,7 @@
 // (u - 8) in fp16, mma.m16n8k16 f16 x f16 -> f16 over the 4 k-steps of a chunk, then the chunk partial
 // is added to fp32 accumulators scaled by (group scale * 16); the K slices (pick_warps, shape-only)
 // are reduced in a fixed order exactly as in the bf16/fp32 kernels.
+#include "kernels/cuda_compat.cuh"
 #include <cuda_fp16.h>
 
 #include "../common.h"
@@ -38,11 +39,7 @@ __device__ __forceinline__ void store_xh4(__half* row, int k, float a, float b, 
 }
 
 __device__ __forceinline__ void xh_mma(uint32_t c[2], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, "
-        "{%0,%1};"
-        : "+r"(c[0]), "+r"(c[1])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_fp16_packed(c[0], c[1], a[0], a[1], a[2], a[3], b0, b1);
 }
 // packed nibbles u = w + 8 -> four fp16x2 A-fragment registers holding the exact integers w
 __device__ __forceinline__ void xh_dequant(uint32_t q, uint32_t a[4]) {

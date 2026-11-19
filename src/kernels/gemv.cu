@@ -1,3 +1,4 @@
+#include "kernels/cuda_compat.cuh"
 #include "../env.h"
 #include "gemv.cuh"
 #include "gemv_h16.cuh"
@@ -15,11 +16,7 @@ __device__ __forceinline__ uint4 ldg_stream(const uint4* p) {
 }
 
 __device__ __forceinline__ void mma_bf16(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-        "{%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_bf16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 
 // Unsigned nibbles (w+8) -> bf16x2 (w) without int->float conversion: OR the nibble into
@@ -564,11 +561,7 @@ __global__ void repack_w16_kernel(const bf16* __restrict__ src, int N, int K,
 }
 
 __device__ __forceinline__ void mma_f16(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-        "{%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_fp16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 
 
@@ -963,7 +956,7 @@ __global__ void repack_q8_kernel(const int32_t* __restrict__ src, int N, int K, 
 // each warp reads its fragments from there (lane-contiguous 16-byte loads, conflict-free) and prefetches
 // the weights of the next group. Per-tile arithmetic and order are exactly gemv_w8p_kernel's (bit-identical).
 __device__ __forceinline__ void cp_async16_g(unsigned smem, const void* gmem) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem), "l"(gmem));
+    qe::cuda_compat::copy_to_shared<16>(smem, gmem);
 }
 template <int NT, int WB, int TW, int S>
 __global__ void __launch_bounds__(WB * 32) gemv_w8s_kernel(const uint4* __restrict__ q, const bf16* __restrict__ s,
@@ -982,7 +975,7 @@ __global__ void __launch_bounds__(WB * 32) gemv_w8s_kernel(const uint4* __restri
                 cp_async16_g((unsigned)__cvta_generic_to_shared(&xs[st][i]), xp + ((size_t)nt * kps + gi * 4) * 32 + r);
             }
         }
-        asm volatile("cp.async.commit_group;");
+        qe::cuda_compat::copy_commit();
     };
 #pragma unroll
     for (int i = 0; i < S - 1; i++) issue(i);
@@ -1009,7 +1002,7 @@ __global__ void __launch_bounds__(WB * 32) gemv_w8s_kernel(const uint4* __restri
 #pragma unroll
         for (int i = 0; i < 4; i++) wn[tw][i] = ok[tw] ? ldg_stream(qp[tw] + (size_t)i * 32) : make_uint4(0, 0, 0, 0);
     for (int gi = 0; gi < groups; gi++) {
-        asm volatile("cp.async.wait_group %0;" ::"n"(S - 2));
+        qe::cuda_compat::copy_wait<S - 2>();
         __syncthreads();
         issue(gi + S - 1);
         uint4 w[TW][4];
@@ -1060,7 +1053,7 @@ __global__ void __launch_bounds__(WB * 32) gemv_w8s_kernel(const uint4* __restri
                 acc[tw][nt][2] += c[tw][nt][2] * sg8[tw]; acc[tw][nt][3] += c[tw][nt][3] * sg8[tw];
             }
     }
-    asm volatile("cp.async.wait_group 0;");
+    qe::cuda_compat::copy_wait<0>();
 #pragma unroll
     for (int tw = 0; tw < TW; tw++) {
         if (!ok[tw]) continue;
@@ -1162,7 +1155,7 @@ __global__ void glu_rows_kernel(const int32_t* __restrict__ sq, const bf16* __re
 __global__ void prefetch_l2_kernel(const char* __restrict__ p, size_t bytes) {
     for (size_t off = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 128; off < bytes;
          off += (size_t)gridDim.x * blockDim.x * 128)
-        asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(p + off));
+        qe::cuda_compat::prefetch_l2(p + off);
 }
 
 // ---- experiment: GEMV launched before its input is ready. Each warp stages the weights
@@ -1209,10 +1202,10 @@ __global__ void __launch_bounds__(256, 4) gemv_w4h_early_kernel(const uint4* __r
     for (int j = 0; j < S; j++)
         if (gb + D + j < ge) {
             const uint4* src = qp + (size_t)(2 * (gb + D + j)) * 32;
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"((unsigned)__cvta_generic_to_shared(stw + j * 64 + lane)), "l"(src));
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"((unsigned)__cvta_generic_to_shared(stw + j * 64 + 32 + lane)), "l"(src + 32));
+            qe::cuda_compat::copy_to_shared<16>((unsigned)__cvta_generic_to_shared(stw + j * 64 + lane), src);
+            qe::cuda_compat::copy_to_shared<16>((unsigned)__cvta_generic_to_shared(stw + j * 64 + 32 + lane), src + 32);
         }
-    asm volatile("cp.async.commit_group;");
+    qe::cuda_compat::copy_commit();
     if (fused && r < arf::items(far)) arf::ll16_chunk(far);  // this block also reduces 32 words of a row
     if (flag) {
         if (threadIdx.x == 0) {
@@ -1238,7 +1231,7 @@ __global__ void __launch_bounds__(256, 4) gemv_w4h_early_kernel(const uint4* __r
         }
         __syncthreads();
     }
-    asm volatile("cp.async.wait_all;" ::: "memory");
+    qe::cuda_compat::copy_wait_all();
     __syncwarp();
     float acc[1][4] = {{0.f, 0.f, 0.f, 0.f}};
     for (int g0 = gb; g0 < ge; g0 += D) {

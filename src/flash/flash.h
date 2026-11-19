@@ -1212,6 +1212,7 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     void set_card_share(double f) { card_share_ = std::clamp(f, 0.05, 1.0); }
     void set_card_workers(int n) { card_workers_ = std::max(1, n); }  // workers on this card (the graph budget is split)
   private:
+    size_t smem_limit_ = 0;  // opt-in bytes per CUDA block on this device
     int dev_, max_ctx_, rows_ = 0;  // owned KV rows per card (the pool: logical rows when streaming)
     // KV streaming (FLASH_KV_STREAM): rows_ = logical pool rows (FLASH_KV_STREAM_CTX positions, host memory), srows_ =
     // rows of one sequence of max_ctx (selection buffers, device K / V arrays: block cache + expert-cache tail),

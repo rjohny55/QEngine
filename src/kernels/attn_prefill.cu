@@ -7,6 +7,7 @@
 // Keys stream from the kv cache in tiles of 32. With an FP8 (e4m3) cache, tiles arrive as fp8
 // through a double-buffered cp.async stage (half the bytes) and are widened to bf16 in shared
 // memory; the per-tensor k/v scales are folded into the score scale and the output.
+#include "kernels/cuda_compat.cuh"
 #include "../env.h"
 #include <algorithm>
 #include <chrono>
@@ -35,12 +36,11 @@ constexpr int ROWCH8 = D / 16; // 16-byte chunks per fp8 row
 
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool pred) {
     const unsigned s = __cvta_generic_to_shared(smem);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(s), "l"(gmem),
-                 "r"(pred ? 16 : 0));
+    qe::cuda_compat::copy_to_shared<16>(s, gmem, pred ? 16 : 0);
 }
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;"); }
+__device__ __forceinline__ void cp_commit() { qe::cuda_compat::copy_commit(); }
 template <int N>
-__device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N)); }
+__device__ __forceinline__ void cp_wait() { qe::cuda_compat::copy_wait<N>(); }
 
 __device__ __forceinline__ void ldsm_x4(uint32_t r[4], const void* p) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
@@ -53,25 +53,13 @@ __device__ __forceinline__ void ldsm_x4_t(uint32_t r[4], const void* p) {
                  : "r"((unsigned)__cvta_generic_to_shared(p)));
 }
 __device__ __forceinline__ void mma(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-        "{%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_bf16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 __device__ __forceinline__ void mma_f16(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-        "{%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_fp16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 __device__ __forceinline__ void mma_hacc(uint32_t c[2], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, "
-        "{%0,%1};"
-        : "+r"(c[0]), "+r"(c[1])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_fp16_packed(c[0], c[1], a[0], a[1], a[2], a[3], b0, b1);
 }
 template <bool H>
 __device__ __forceinline__ void mma_t(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
@@ -599,9 +587,7 @@ template <bool QK8, int BK> constexpr int p8_sk() { return p8_v8<QK8, BK>() + BK
 template <bool QK8, int BK> constexpr size_t p8_smem() { return (size_t)(p8_sk<QK8, BK>() + (QK8 ? BK / 2 : 0)) * 16; }
 constexpr int kP8K16 = 0;
 __device__ __forceinline__ void imma(uint32_t c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_int8<false>(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 // fp16 x -> int8 round(x * inv) in the low byte of each half (x * inv + 1536 rounds to an integer:
 // fp16's ulp in [1024, 2048) is 1, and |x * inv| <= 127)
@@ -620,7 +606,7 @@ __device__ __forceinline__ void f8x4_to_f16(uint32_t q, uint32_t& e, uint32_t& o
 // sink below the copy of the next tile into the same stage (no barrier in between)
 __device__ __forceinline__ void cp_async16m(void* smem, const void* gmem, bool pred) {
     const unsigned sa = __cvta_generic_to_shared(smem);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sa), "l"(gmem), "r"(pred ? 16 : 0) : "memory");
+    qe::cuda_compat::copy_to_shared<16>(sa, gmem, pred ? 16 : 0);
 }
 __device__ __forceinline__ void ldsm_x4a(uint32_t r[4], unsigned a) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
@@ -2202,11 +2188,26 @@ void set_dec8() {
 }
 constexpr int kDecKG = 2;
 
-template <int NW, bool F8, bool DEC>
-constexpr size_t smem_for() { return smem_bytes<NW, F8, bkv_for<F8, DEC>(), !DEC>(); }
+template <int NW, bool F8, bool DEC, int BKV = bkv_for<F8, DEC>()>
+constexpr size_t smem_for() { return smem_bytes<NW, F8, BKV, !DEC>(); }
+
+thread_local int attention_smem_limit = 0;
+
+int attention_limit() {
+    if (!attention_smem_limit) attention_smem_limit = qe_shared_memory_limit();
+    return attention_smem_limit;
+}
 
 template <int NW, bool F8, bool DEC>
 void set_attr() {
+    if constexpr (!F8 && DEC) {
+        if (smem_for<NW, F8, DEC>() > size_t(attention_limit())) {
+            CUDA_CHECK(cudaFuncSetAttribute(attn_tc_kernel<NW, F8, DEC, 16>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            (int)smem_for<NW, F8, DEC, 16>()));
+            return;
+        }
+    }
     CUDA_CHECK(cudaFuncSetAttribute(attn_tc_kernel<NW, F8, DEC>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     (int)smem_for<NW, F8, DEC>()));
@@ -2216,6 +2217,13 @@ template <int NW, bool F8, bool DEC>
 void launch(dim3 grid, const bf16* q, const void* kc, const void* vc, const AttnShape& s,
             const float* proj, int ld, const int* pos, int m, bf16* out, float* work,
             cudaStream_t st) {
+    if constexpr (!F8 && DEC) {
+        if (smem_for<NW, F8, DEC>() > size_t(attention_limit())) {
+            attn_tc_kernel<NW, F8, DEC, 16><<<grid, threads_for<NW>(), smem_for<NW, F8, DEC, 16>(), st>>>(
+                q, kc, vc, s, proj, ld, pos, m, out, work);
+            return;
+        }
+    }
     attn_tc_kernel<NW, F8, DEC><<<grid, threads_for<NW>(), smem_for<NW, F8, DEC>(), st>>>(
         q, kc, vc, s, proj, ld, pos, m, out, work);
 }
@@ -3308,6 +3316,7 @@ size_t attention_prefill_work_floats(int max_rows_x_splits, int nq) {
 
 template <bool QK8, int NW>
 static void set_pf8() {
+    if (p8_smem<QK8, NW * 8>() > size_t(attention_limit())) return;
     CUDA_CHECK(cudaFuncSetAttribute(attn_pf8_kernel<QK8, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     (int)p8_smem<QK8, NW * 8>()));
     CUDA_CHECK(cudaFuncSetAttribute(attn_pf8_kernel<QK8, NW>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
@@ -3315,11 +3324,11 @@ static void set_pf8() {
 // QE_PATTN_NW: warps of attn_pf8_kernel (8 = 128 rows, 64-key tiles, 1 block/SM; 4 = 64 rows, 32-key tiles, 2 blocks/SM)
 static bool pf8_pp() {  // QE_PATTN_PP=1: the ping-pong kernel attn_pp8_kernel (fp16 Q K^T only)
     static const bool pp = env_set("QE_PATTN_PP") ? env_int("QE_PATTN_PP", false) != 0 : false;
-    return pp;
+    return pp && size_t(attention_limit()) >= kPKSmem;
 }
 static int pf8_nw() {
     static const int nw = env_int("QE_PATTN_NW", 8);
-    return nw == 4 ? 4 : 8;
+    return nw == 4 || p8_smem<false, 64>() > size_t(attention_limit()) ? 4 : 8;
 }
 template <bool QK8, int NW>
 static void launch_pf8(int m, int splits, const bf16* q, const void* kc, const void* vc, const AttnShape& s2,
@@ -3332,12 +3341,14 @@ static void launch_pf8(int m, int splits, const bf16* q, const void* kc, const v
 void attention_prefill_init() {
     set_attr<4, false, false>();
     set_attr<4, true, false>();
-    CUDA_CHECK(cudaFuncSetAttribute(attn_pp8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kPPSmem));
-    CUDA_CHECK(cudaFuncSetAttribute(attn_pp8_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-    CUDA_CHECK(cudaFuncSetAttribute(attn_pkv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kPKSmem));
-    CUDA_CHECK(cudaFuncSetAttribute(attn_pkv_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-    CUDA_CHECK(cudaFuncSetAttribute(attn_pkp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kPKSmem));
-    CUDA_CHECK(cudaFuncSetAttribute(attn_pkp_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    if (size_t(attention_limit()) >= kPKSmem) {
+        CUDA_CHECK(cudaFuncSetAttribute(attn_pp8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kPPSmem));
+        CUDA_CHECK(cudaFuncSetAttribute(attn_pp8_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+        CUDA_CHECK(cudaFuncSetAttribute(attn_pkv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kPKSmem));
+        CUDA_CHECK(cudaFuncSetAttribute(attn_pkv_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+        CUDA_CHECK(cudaFuncSetAttribute(attn_pkp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kPKSmem));
+        CUDA_CHECK(cudaFuncSetAttribute(attn_pkp_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    }
     {
         const int cpos = env_int("QE_PKP_CPOS", 50);
         CUDA_CHECK(cudaMemcpyToSymbol(s_pkp_cpos, &cpos, sizeof(int)));
@@ -3395,9 +3406,11 @@ void attention_decode_tc_init() {
     set_dec8d<1>();
     set_dec8d<2>();
     set_dec8d<3>();
-    set_dec8<1, kDecKG>();
-    set_dec8<2, kDecKG>();
-    set_dec8<3, kDecKG>();
+    if (size_t(attention_limit()) >= dec8_smem<3, kDecKG>()) {
+        set_dec8<1, kDecKG>();
+        set_dec8<2, kDecKG>();
+        set_dec8<3, kDecKG>();
+    }
     set_attr<1, false, true>();
     set_attr<2, false, true>();
     set_attr<3, false, true>();
@@ -3423,6 +3436,7 @@ static bool pattn_smooth() {
 // conversion + attention launch pair per window (attn_pkv_kernel), 0 = off
 int g_pattn_kvpre = -1, g_pkp_splits = -1, g_pkp_min = -1;  // bench overrides (qe_pattn_mode), -1: env / default
 static int pattn_kvpre() {
+    if (size_t(attention_limit()) < kPKSmem) return 0;
     static const int v = env_int("QE_PATTN_KVPRE", 2);
     return g_pattn_kvpre >= 0 ? g_pattn_kvpre : v;
 }
@@ -3680,6 +3694,7 @@ void attention_prefill(const bf16* q, const void* kc, const void* vc, const Attn
 }
 
 static int dec8d_mode() {
+    if (size_t(attention_limit()) < dec8_smem<3, kDecKG>()) return 2;
     static const int d8d = env_int("QE_ATTN_DEC8D", 2);
     return d8d;
 }

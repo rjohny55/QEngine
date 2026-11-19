@@ -1,5 +1,6 @@
 // Microbench hooks for experiments (not used by the engine): an AR-latency stand-in
 // (one block spinning on the global timer) and L2 prefetch variants of the next GEMV's weights.
+#include "kernels/cuda_compat.cuh"
 #include <cstdint>
 #include <vector>
 #include <cuda_runtime.h>
@@ -21,7 +22,7 @@ __global__ void spin_kernel(unsigned long long ns) {
 __global__ void pf_prefix_kernel(const char* __restrict__ p, size_t bytes) {
     for (size_t off = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 128; off < bytes;
          off += (size_t)gridDim.x * blockDim.x * 128)
-        asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(p + off));
+        qe::cuda_compat::prefetch_l2(p + off);
 }
 
 // spread pattern: the first `per` bytes of every one of `nseg` equal segments of the matrix (each
@@ -32,7 +33,7 @@ __global__ void pf_spread_kernel(const char* __restrict__ p, size_t seg_bytes, i
     const size_t total = lines * nseg;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (size_t)gridDim.x * blockDim.x) {
         const size_t s = i / lines, l = i % lines;
-        asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(p + s * seg_bytes + l * 128));
+        qe::cuda_compat::prefetch_l2(p + s * seg_bytes + l * 128);
     }
 }
 

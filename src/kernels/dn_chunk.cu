@@ -13,6 +13,7 @@
 // dn_chunk_prep: everything independent of S0, for all chunks in parallel (MMA: fp16 operands,
 // fp32 accumulation; the triangular inverse T in fp32). dn_chunk_scan: the chunks of one head in
 // order, a 64-column v slice per block, the state slice in fp32 MMA accumulators.
+#include "kernels/cuda_compat.cuh"
 #include "../env.h"
 #include <algorithm>
 #include <cfloat>
@@ -45,25 +46,20 @@ __device__ __forceinline__ void ldsm_x4_t(uint32_t r[4], const void* p) {
                  : "r"((unsigned)__cvta_generic_to_shared(p)));
 }
 __device__ __forceinline__ void mma(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-        "{%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_fp16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 __device__ __forceinline__ uint32_t h2(float a, float b) {
     __half2 h = __floats2half2_rn(a, b);
     return *reinterpret_cast<uint32_t*>(&h);
 }
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(
-                     (unsigned)__cvta_generic_to_shared(smem)),
-                 "l"(gmem));
+    qe::cuda_compat::copy_to_shared<16>(
+                     (unsigned)__cvta_generic_to_shared(smem), gmem);
 }
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;"); }
-__device__ __forceinline__ void cp_wait0() { asm volatile("cp.async.wait_group 0;"); }
+__device__ __forceinline__ void cp_commit() { qe::cuda_compat::copy_commit(); }
+__device__ __forceinline__ void cp_wait0() { qe::cuda_compat::copy_wait<0>(); }
 template <int N>
-__device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N)); }
+__device__ __forceinline__ void cp_wait() { qe::cuda_compat::copy_wait<N>(); }
 
 // fp16 tiles in shared memory, rows of R halves (R = 64 or 128) split in 16-byte chunks whose
 // index is XOR-swizzled with (row & 7): ldmatrix row reads are bank-conflict free.
@@ -897,12 +893,19 @@ void dn_chunk_reserve(int nv, int m_max) {
     qe_ws_reserve("dn_gcs", pairs * 4);
 }
 
+bool dn_chunk_supported() {
+    static thread_local const bool supported = kPrepSmem <= size_t(qe_shared_memory_limit());
+    return supported;
+}
+
 int dn_chunk_min() {
+    if (!dn_chunk_supported()) return 0;
     static const int v = env_int("QE_DN_CHUNK", 64);
     return v;
 }
 
 void dn_chunk_init() {
+    if (!dn_chunk_supported()) return;
     CUDA_CHECK(cudaFuncSetAttribute(dn_chunk_prep_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     (int)kPrepSmem));
     CUDA_CHECK(cudaFuncSetAttribute(dn_chunk_prep_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -925,6 +928,7 @@ void dn_chunk_init() {
 void dn_core_chunked(const float* conv_out, int ch, const DeltaShape& s, const float* qk,
                      const float* gb, float* S, size_t slot_floats, const int* cur, int m,
                      float* o, cudaStream_t st, int slot_off, bool h16, const DnConvIn* ci) {
+    CHECK(dn_chunk_supported(), "chunked GDN needs %zu bytes of dynamic shared memory", kPrepSmem);
     const int nch = (m + C - 1) / C;
     const size_t need = (size_t)s.nv * nch * kPer;
     if (need > tl_scr_n) {  // grows during the first prefills (never inside graph capture)

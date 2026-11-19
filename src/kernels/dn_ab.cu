@@ -3,17 +3,14 @@
 // gemm_w16 spends ~43 us per 1024 tokens on it (tile of 128+ rows for 32 outputs, 16 K-splits);
 // here a block of 8 warps owns 16 tokens and all 32 rows, the warps split K, and the partial
 // sums are reduced in shared memory in a fixed warp order (one ab slice, no split-K buffer).
+#include "kernels/cuda_compat.cuh"
 #include "gemv.cuh"
 #include "ops.cuh"
 
 namespace {
 
 __device__ __forceinline__ void mma_bf16_ab(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-        "{%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_bf16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 
 constexpr int kAbWarps = 8, kAbRT = 2, kAbNT = 2;  // 32 rows, 16 tokens per block

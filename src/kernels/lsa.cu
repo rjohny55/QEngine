@@ -1,6 +1,7 @@
 // Latent Sparse Attention for the 27B full-attention layers. Own implementation of the D-LSA flat design
 // of arXiv 2610.42147 (Apache-2.0 reference: github.com/Prefrontal-AI/latent-sparse-attention, ideas only).
 // Step 2b: simple, correct kernels for the end-to-end gate; the fast prefill / decode kernels come in step 3.
+#include "kernels/cuda_compat.cuh"
 #include <cfloat>
 #include <cuda_fp8.h>
 #include "lsa.cuh"
@@ -587,9 +588,7 @@ __global__ void __launch_bounds__(128) lsa_scan_kernel(const bf16* __restrict__ 
             for (int sl = 0; sl < 4; sl++) {
                 const uint32_t b0r = *reinterpret_cast<const uint32_t*>(&cs[nb * 8 + g][16 * sl + 2 * t4]);
                 const uint32_t b1r = *reinterpret_cast<const uint32_t*>(&cs[nb * 8 + g][16 * sl + 2 * t4 + 8]);
-                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                             : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                             : "r"(qa[sl][0]), "r"(qa[sl][1]), "r"(qa[sl][2]), "r"(qa[sl][3]), "r"(b0r), "r"(b1r));
+                qe::cuda_compat::mma_bf16(c[0], c[1], c[2], c[3], qa[sl][0], qa[sl][1], qa[sl][2], qa[sl][3], b0r, b1r);
             }
             for (int e = 0; e < 4; e++) {
                 const int x = e >> 1, b = b0 + nb * 8 + 2 * t4 + (e & 1);
@@ -1019,9 +1018,7 @@ __global__ void __launch_bounds__(NT) lsa_union_kernel(const unsigned* __restric
 }
 
 __device__ __forceinline__ void mma16816(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_fp16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 // four e4m3 bytes b0..b3 -> e = (b0, b2), o = (b1, b3) as fp16, value * 2^-8 (subnormals included)
 __device__ __forceinline__ void f8x4_h(uint32_t q, uint32_t& e, uint32_t& o) {
@@ -1031,7 +1028,7 @@ __device__ __forceinline__ void f8x4_h(uint32_t q, uint32_t& e, uint32_t& o) {
 }
 __device__ __forceinline__ void cp16(void* smem, const void* g, bool pred) {
     const unsigned sa = (unsigned)__cvta_generic_to_shared(smem);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sa), "l"(g), "r"(pred ? 16 : 0) : "memory");
+    qe::cuda_compat::copy_to_shared<16>(sa, g, pred ? 16 : 0);
 }
 __device__ __forceinline__ void ldsm4t(uint32_t r[4], unsigned a) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
@@ -1051,9 +1048,7 @@ constexpr int kTK = 32;
 // K fp8 rows and V fp16 rows: 16-byte chunks XOR-swizzled by (key & 7) (conflict-free fragment / ldmatrix reads)
 constexpr int kTcSmem = 2 * kTK * 256 + 2 * kTK * 256 + kTK * 512 + kTK / 4 * 4;
 __device__ __forceinline__ void mma16816h(uint32_t c[2], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
-                 : "+r"(c[0]), "+r"(c[1])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_fp16_packed(c[0], c[1], a[0], a[1], a[2], a[3], b0, b1);
 }
 template <bool QK16>
 __global__ void __launch_bounds__(96) lsa_attn_tc_kernel(const bf16* __restrict__ q, const unsigned char* __restrict__ kc,
@@ -1116,16 +1111,16 @@ __global__ void __launch_bounds__(96) lsa_attn_tc_kernel(const bf16* __restrict_
             else
                 cp16(vs8 + ((size_t)st * kTK + key) * 256 + (part - 16) * 16, vc + row * 256 + (part - 16) * 16, ok);
         }
-        asm volatile("cp.async.commit_group;" ::: "memory");
+        qe::cuda_compat::copy_commit();
     };
     if (ntile > 0) load(0, 0);
     for (int ti = 0; ti < ntile; ti++) {
         const int st = ti & 1;
         if (ti + 1 < ntile) {
             load(ti + 1, st ^ 1);
-            asm volatile("cp.async.wait_group 1;" ::: "memory");
+            qe::cuda_compat::copy_wait<1>();
         } else {
-            asm volatile("cp.async.wait_group 0;" ::: "memory");
+            qe::cuda_compat::copy_wait<0>();
         }
         __syncthreads();
         {   // widen V to fp16 [key][dim] (values * 2^-8), masks of the tile's pools

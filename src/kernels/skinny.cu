@@ -12,6 +12,7 @@
 // warp (tiles, w) accumulates K slice w = groups [w*G/nw, (w+1)*G/nw) of each of its tiles
 // sequentially in the mma accumulator, nw = pick_warps(tiles, G) as in gemv_w4, and the slices
 // are added in order w = 0..nw-1 at the end. Weights are dequantized exactly as in the GEMV.
+#include "kernels/cuda_compat.cuh"
 #include "../env.h"
 #include "gemv.cuh"
 #include "gemv_h16.cuh"
@@ -27,11 +28,7 @@ __device__ __forceinline__ uint4 ldg_stream(const uint4* p) {
 }
 
 __device__ __forceinline__ void mma_bf16(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-        "{%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_bf16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 
 __device__ __forceinline__ void dequant_w4(uint32_t q, uint32_t a[4]) {
@@ -48,11 +45,11 @@ __device__ __forceinline__ void dequant_w4(uint32_t q, uint32_t a[4]) {
 __device__ __forceinline__ float silu_f(float x) { return x / (1.f + __expf(-x)); }
 
 __device__ __forceinline__ void cp_async16(unsigned smem, const void* gmem) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem), "l"(gmem));
+    qe::cuda_compat::copy_to_shared<16>(smem, gmem);
 }
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
+__device__ __forceinline__ void cp_async_commit() { qe::cuda_compat::copy_commit(); }
 template <int N>
-__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N)); }
+__device__ __forceinline__ void cp_async_wait() { qe::cuda_compat::copy_wait<N>(); }
 
 __device__ __forceinline__ void ldmatrix_x4(uint32_t r[4], unsigned s) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
@@ -484,9 +481,9 @@ __global__ void __launch_bounds__(kMaxThreads) skinny_w4h_kernel(
 }
 
 template <int NT, int S>
-void set_attr_h() {
+void set_attr_h(int limit) {
     CUDA_CHECK(cudaFuncSetAttribute(skinny_w4h_kernel<NT, S>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxSmem));
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, limit));
 }
 template <int NT, int S>
 void launch_skinny_h(const W4& w, const __half* xh, int ldx, float* y, int ldy, int m, int tiles,
@@ -503,9 +500,9 @@ int skinny_env(const char* name, int def) {
 
 
 template <int NT, int S>
-void set_attr() {
+void set_attr(int limit) {
     CUDA_CHECK(cudaFuncSetAttribute(skinny_w4_kernel<NT, S>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxSmem));
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, limit));
 }
 
 template <int NT, int S>
@@ -545,19 +542,20 @@ int build_warps(int TPB, int nw, SkinnyWarps& wt) {
 
 // Per-device one-time setup (opt-in shared memory); must run outside stream capture.
 void skinny_init() {
+    const int limit = std::min(kMaxSmem, qe_shared_memory_limit() - 1024);
     static bool done[16] = {};
     int dev;
     CUDA_CHECK(cudaGetDevice(&dev));
     if (done[dev]) return;
     done[dev] = true;
-    set_attr<1, 3>(); set_attr<1, 4>(); set_attr<1, 6>();
-    set_attr<2, 3>(); set_attr<2, 4>(); set_attr<2, 6>();
-    set_attr<3, 3>(); set_attr<3, 4>(); set_attr<3, 6>();
-    set_attr<4, 3>(); set_attr<4, 4>(); set_attr<4, 6>();
-    set_attr_h<1, 3>(); set_attr_h<1, 4>(); set_attr_h<1, 6>();
-    set_attr_h<2, 3>(); set_attr_h<2, 4>(); set_attr_h<2, 6>();
-    set_attr_h<3, 3>(); set_attr_h<3, 4>(); set_attr_h<3, 6>();
-    set_attr_h<4, 3>(); set_attr_h<4, 4>(); set_attr_h<4, 6>();
+    set_attr<1, 3>(limit); set_attr<1, 4>(limit); set_attr<1, 6>(limit);
+    set_attr<2, 3>(limit); set_attr<2, 4>(limit); set_attr<2, 6>(limit);
+    set_attr<3, 3>(limit); set_attr<3, 4>(limit); set_attr<3, 6>(limit);
+    set_attr<4, 3>(limit); set_attr<4, 4>(limit); set_attr<4, 6>(limit);
+    set_attr_h<1, 3>(limit); set_attr_h<1, 4>(limit); set_attr_h<1, 6>(limit);
+    set_attr_h<2, 3>(limit); set_attr_h<2, 4>(limit); set_attr_h<2, 6>(limit);
+    set_attr_h<3, 3>(limit); set_attr_h<3, 4>(limit); set_attr_h<3, 6>(limit);
+    set_attr_h<4, 3>(limit); set_attr_h<4, 4>(limit); set_attr_h<4, 6>(limit);
 }
 
 // Engine policy: on by default (QE_SKINNY=0 disables) for m >= QE_SKINNY_MIN_M (17) rows on matrices
@@ -585,10 +583,11 @@ bool skinny_w4(const W4& w, const bf16* x, int ldx, float* y, int ldy, int m, cu
     for (int ww = 0; ww < nw; ww++) L = std::max(L, 2 * ((ww + 1) * groups / nw - ww * groups / nw));
     const size_t stage = (size_t)nw * 8 * NT * kRowBytes;
     const size_t red = (size_t)nw * TPB * NT * 4 * 32 * sizeof(float);
+    const int limit = std::min(kMaxSmem, qe_shared_memory_limit() - 1024);
     int S = s_env ? std::min(6, std::max(3, s_env)) : 4;
-    while (S > 3 && S * stage > kMaxSmem) S = S == 6 ? 4 : 3;
+    while (S > 3 && S * stage > limit) S = S == 6 ? 4 : 3;
     const size_t smem = std::max(S * stage, red);
-    if (smem > kMaxSmem) return false;
+    if (smem > limit) return false;
 #define QE_SK(NT_, S_) launch_skinny<NT_, S_>(w, x, ldx, y, ldy, m, tiles, TPB, nw, warps, wt, L, smem, st)
 #define QE_SKS(NT_) if (S == 6) QE_SK(NT_, 6); else if (S == 4) QE_SK(NT_, 4); else QE_SK(NT_, 3)
     switch (NT) {
@@ -620,10 +619,11 @@ bool skinny_w4h(const W4& w, const __half* xh, int ldx, float* y, int ldy, int m
     for (int ww = 0; ww < nw; ww++) L = std::max(L, 2 * ((ww + 1) * groups / nw - ww * groups / nw));
     const size_t stage = (size_t)nw * 8 * NT * kRowBytes;
     const size_t red = (size_t)nw * TPB * NT * 4 * 32 * sizeof(float);
+    const int limit = std::min(kMaxSmem, qe_shared_memory_limit() - 1024);
     int S = s_env ? std::min(6, std::max(3, s_env)) : 4;
-    while (S > 3 && S * stage > kMaxSmem) S = S == 6 ? 4 : 3;
+    while (S > 3 && S * stage > limit) S = S == 6 ? 4 : 3;
     const size_t smem = std::max(S * stage, red);
-    if (smem > kMaxSmem) return false;
+    if (smem > limit) return false;
 #define QE_SKH(NT_, S_) launch_skinny_h<NT_, S_>(w, xh, ldx, y, ldy, m, tiles, TPB, nw, warps, wt, L, smem, st, yh, ldyh)
 #define QE_SKHS(NT_) if (S == 6) QE_SKH(NT_, 6); else if (S == 4) QE_SKH(NT_, 4); else QE_SKH(NT_, 3)
     switch (NT) {

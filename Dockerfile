@@ -7,6 +7,7 @@
 #   docker build -t qengine .                       # with vision (torch, ~+4 GB)
 #   docker build -t qengine --build-arg VISION=0 .  # text only, no torch
 #   docker build -t qengine --build-arg CUDA_ARCHS=86 .  # RTX 3090 code only (faster build)
+#   docker build -t qengine:cmp50 --build-arg CUDA_ARCHS=75 --build-arg VISION=0 .  # experimental Turing
 
 ARG CUDA_VERSION=13.1.1
 ARG UBUNTU=ubuntu24.04

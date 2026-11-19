@@ -2794,7 +2794,10 @@ static void lsa_dump(const Worker& w, int rank, int li, int ord, const AttnShape
 // QE_LSA_PF_MIN / QE_LSA_DEC_MIN: prefill chunks / decode steps starting below these positions keep the dense kernels.
 void Worker::lsa_load(const std::string& path) {
     // refusals: one behaviour (LSA off, the reason on stdout with the start-up lines, the server runs dense)
-    const char* why = !lsa_allowed_ ? lsa_refusal_.c_str() : !kv_fp8_ || kv4_ ? "it needs the FP8 KV cache (QE_KV_FP8=1, not QE_KV_BITS=4)" : nullptr;
+    const char* why = !lsa_allowed_ ? lsa_refusal_.c_str() : nullptr;
+    if (!why && (!kv_fp8_ || kv4_)) why = "it needs the FP8 KV cache (QE_KV_FP8=1, not QE_KV_BITS=4)";
+    if (!why && qe_shared_memory_limit() < kLsaUnionSmem + 4096)
+        why = "the LSA kernels need more shared memory than this GPU provides";
     if (why) {
         if (rank == 0) printf("LSA off: %s; full attention\n", why);
         return;

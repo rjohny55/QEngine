@@ -10,6 +10,7 @@
 // the chunk uses bytes [8s, 8s + 8) of the lane's 16 (b0 = block 2s, b1 = block 2s + 1).
 // Scales: {sx, -M sx} per (row, G-group) (sx = the scale of the true activation, the XH factor 16 included).
 // Rows are stored in place of the XH rows: row r's XQ bytes at xq + r * XQ_LD, its scales at xqs + r * XQS_LD.
+#include "kernels/cuda_compat.cuh"
 #include "flash_kernels.cuh"
 
 namespace flash {
@@ -19,16 +20,11 @@ constexpr float kQMagic = 12582912.f;  // 1.5 * 2^23
 constexpr uint32_t kQMagicBits = 0x4B400000u;
 
 __device__ __forceinline__ void q_mma(uint32_t c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    qe::cuda_compat::mma_int8<false>(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 __device__ __forceinline__ void q_mma_init(uint32_t c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
-        : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(kQMagicBits));
+    c[0] = c[1] = c[2] = c[3] = kQMagicBits;
+    q_mma(c, a, b0, b1);
 }
 // 4 nibbles (u = w + 8 at bits 0, 8, 16, 24) -> 4 signed int8 bytes w
 __device__ __forceinline__ uint32_t q_nib4(uint32_t q) {
@@ -151,7 +147,7 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
             for (int p2 = 0; p2 < 2; p2++) {
                 const int p = 2 * st_h + p2, ps = p ^ ((st_r & 1) << 2);
                 const unsigned dst = (unsigned)__cvta_generic_to_shared(&xs[b][st_r][ps * 16]);
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(xrow + ks * KS + p * 16));
+                qe::cuda_compat::copy_to_shared<16>(dst, xrow + ks * KS + p * 16);
             }
         }
         // the token's scales: L2 only (.cg / ld.cg), never L1. They live in the XH rows k_xh_to_q quantized in place
@@ -161,13 +157,13 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
         if ((int)threadIdx.x < 8 * NTT) {
             if constexpr (SUB == 2) {
                 const unsigned dst = (unsigned)__cvta_generic_to_shared(&ss[b][threadIdx.x][0]);
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(srow + ks * SUB));
+                qe::cuda_compat::copy_to_shared<16>(dst, srow + ks * SUB);
             } else {
 #pragma unroll
                 for (int s = 0; s < SUB; s++) ss[b][threadIdx.x][s] = __ldcg(srow + ks * SUB + s);
             }
         }
-        asm volatile("cp.async.commit_group;");
+        qe::cuda_compat::copy_commit();
     };
     const int tw0 = WT == 2 ? 2 * warp : 8 * rh + warp;  // first 16-row tile of the warp
     const uint4* qp[WT];
@@ -207,10 +203,10 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
                 sn2[a][0] = sp[a][(ks + 2) * 16 + g]; sn2[a][1] = sp[a][(ks + 2) * 16 + g + 8];
             }
         }
-        asm volatile("cp.async.wait_group %0;" ::"n"(NST - 2));
+        qe::cuda_compat::copy_wait<NST - 2>();
         __syncthreads();
         if (ks + NST - 1 < NKS) stage(ks + NST - 1);
-        else asm volatile("cp.async.commit_group;");  // keep the group count in step
+        else qe::cuda_compat::copy_commit();  // keep the group count in step
         uint32_t ci[WT][NTT][4];  // integer sums of the current activation group (+ M)
 #pragma unroll
         for (int c = 0; c < 2; c++) {  // 64-k chunk c of the step
@@ -255,7 +251,7 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
             }
         }
     }
-    asm volatile("cp.async.wait_group 0;");
+    qe::cuda_compat::copy_wait<0>();
     __syncthreads();  // the next job of this block restages the buffers
 #pragma unroll
     for (int a = 0; a < WT; a++) {
@@ -525,10 +521,10 @@ __global__ void __launch_bounds__(RQ_KMAX / 16) k_x_to_r8(const bf16* __restrict
 // 82 SMs, 232 of 96 rows = 2.8); each output's arithmetic (k order, MMA, rescale) is the same for every TA ([fp-rq]).
 constexpr int RQ_TB = 128, RQ_NB = 128, RQ_NST = 3;
 template <int TA> __host__ __device__ constexpr size_t rq_stage() { return (size_t)32 * TA * 128 + (size_t)RQ_TB * 128 + (size_t)RQ_TB * 8; }  // weights, x, scales
-template <int TA> __host__ __device__ constexpr size_t rq_smem() { return RQ_NST * rq_stage<TA>(); }
+template <int TA, int NST = RQ_NST> __host__ __device__ constexpr size_t rq_smem() { return NST * rq_stage<TA>(); }
 constexpr size_t RQ_STAGE = rq_stage<4>();
 constexpr size_t RQ_SMEM = rq_smem<4>();
-template <int TA>
+template <int TA, int NST = RQ_NST>
 __global__ void __launch_bounds__(256, 1) k_rows_qt(const uint4* __restrict__ wq, const bf16* __restrict__ ws, int K, int N,
                                                    const int8_t* __restrict__ xq, const float2* __restrict__ xsc,
                                                    float* __restrict__ y, int ldy, int m) {
@@ -543,7 +539,7 @@ __global__ void __launch_bounds__(256, 1) k_rows_qt(const uint4* __restrict__ wq
     auto sx_ = [&](int b) { return rq_smem + b * STG + NB * 128; };
     auto ss_ = [&](int b) { return reinterpret_cast<float2*>(rq_smem + b * STG + NB * 128 + RQ_TB * 128); };
     auto stage = [&](int ks) {
-        const int b = ks % RQ_NST;
+        const int b = ks % NST;
         // weights: 2 TA tiles x 128 pieces of 16 B (tile-major, as in global); 256 TA pieces, TA per thread
 #pragma unroll
         for (int i = 0; i < TA; i++) {
@@ -551,7 +547,7 @@ __global__ void __launch_bounds__(256, 1) k_rows_qt(const uint4* __restrict__ wq
             const int T = min(nb0 + tl_, ntile - 1);
             const uint4* src = wq + ((size_t)T * gl + ks * 4) * 32 + w;
             const unsigned dst = (unsigned)__cvta_generic_to_shared(sw_(b) + pc * 16);
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src));
+            qe::cuda_compat::copy_to_shared<16>(dst, src);
         }
         // x: 128 tokens x 8 pieces; 1024 pieces, 4 per thread; piece p of row r at p ^ ((r & 1) << 2)
 #pragma unroll
@@ -559,14 +555,14 @@ __global__ void __launch_bounds__(256, 1) k_rows_qt(const uint4* __restrict__ wq
             const int pc = threadIdx.x + 256 * i, r = pc >> 3, p = pc & 7;
             const int t = min(t0 + r, m - 1);
             const unsigned dst = (unsigned)__cvta_generic_to_shared(sx_(b) + r * 128 + ((p ^ ((r & 1) << 2)) * 16));
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(xq + (size_t)t * K + ks * 128 + p * 16));
+            qe::cuda_compat::copy_to_shared<16>(dst, xq + (size_t)t * K + ks * 128 + p * 16);
         }
         if (threadIdx.x < RQ_TB) {
             const int t = min(t0 + (int)threadIdx.x, m - 1);
             const unsigned dst = (unsigned)__cvta_generic_to_shared(ss_(b) + threadIdx.x);
-            asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(dst), "l"(xsc + (size_t)t * nks + ks));
+            qe::cuda_compat::copy_to_shared<8>(dst, xsc + (size_t)t * nks + ks);
         }
-        asm volatile("cp.async.commit_group;");
+        qe::cuda_compat::copy_commit();
     };
     float acc[TA][4][4];
 #pragma unroll
@@ -574,15 +570,15 @@ __global__ void __launch_bounds__(256, 1) k_rows_qt(const uint4* __restrict__ wq
 #pragma unroll
         for (int j = 0; j < 4; j++) acc[a][j][0] = acc[a][j][1] = acc[a][j][2] = acc[a][j][3] = 0.f;
 #pragma unroll
-    for (int s = 0; s < RQ_NST - 1; s++)
+    for (int s = 0; s < NST - 1; s++)
         if (s < nks) stage(s);
-        else asm volatile("cp.async.commit_group;");
+        else qe::cuda_compat::copy_commit();
     for (int ks = 0; ks < nks; ks++) {
-        const int b = ks % RQ_NST;
-        asm volatile("cp.async.wait_group %0;" ::"n"(RQ_NST - 2));
+        const int b = ks % NST;
+        qe::cuda_compat::copy_wait<NST - 2>();
         __syncthreads();
-        if (ks + RQ_NST - 1 < nks) stage(ks + RQ_NST - 1);
-        else asm volatile("cp.async.commit_group;");
+        if (ks + NST - 1 < nks) stage(ks + NST - 1);
+        else qe::cuda_compat::copy_commit();
         // weight scales of this stage (rows g, g + 8 of the warp's 4 tiles)
         float sw0[TA], sw8[TA];
 #pragma unroll
@@ -636,7 +632,7 @@ __global__ void __launch_bounds__(256, 1) k_rows_qt(const uint4* __restrict__ wq
             }
         }
     }
-    asm volatile("cp.async.wait_group 0;");
+    qe::cuda_compat::copy_wait<0>();
 #pragma unroll
     for (int a = 0; a < TA; a++) {
         const int T = nb0 + TA * wn + a;
@@ -907,7 +903,7 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
                     unsigned char* dp = scl ? rb + 2 * QP_KT * (HD / 2) + ((size_t)kv * QP_KT + key) * 16
                                             : rb + ((size_t)kv * QP_KT + key) * (HD / 2) + c * 16;
                     const unsigned dst = (unsigned)__cvta_generic_to_shared(dp);
-                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(msk ? 16 : 0));
+                    qe::cuda_compat::copy_to_shared<16>(dst, src, msk ? 16 : 0);
                 }
             }
             if (threadIdx.x < QP_KT) {
@@ -931,7 +927,7 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
                     kv_rowp<false>(km, kc, vc, ks, vs, rb0, msk ? kr : 0, kvh, k8, v8, s0, s1);
                     const uint8_t* src = (kv ? v8 : k8) + c * 16;
                     const unsigned dst = (unsigned)__cvta_generic_to_shared(rb + ((size_t)kv * QP_KT + key) * HD + c * 16);
-                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(msk ? 16 : 0));
+                    qe::cuda_compat::copy_to_shared<16>(dst, src, msk ? 16 : 0);
                 }
             }
             if (threadIdx.x < 2 * QP_KT) {
@@ -944,11 +940,11 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
                 kv_rowp(km, kc, vc, ks, vs, rb0, msk ? kr : 0, kvh, k8, v8, s0, s1);
                 const float* src = kv ? s1 : s0;
                 const unsigned dst = (unsigned)__cvta_generic_to_shared(rm + kv * QP_KT + key);
-                asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(dst), "l"(src), "r"(msk ? 4 : 0));
+                qe::cuda_compat::copy_to_shared<4>(dst, src, msk ? 4 : 0);
                 if (kv == 0) rm[2 * QP_KT + key] = __uint_as_float(msk);
             }
         }
-        asm volatile("cp.async.commit_group;");
+        qe::cuda_compat::copy_commit();
     };
     // ring slot of `tile` -> fp16 buffer buf (fp8 widened exactly; scales x 256)
     auto convert = [&](int tile, int buf) {
@@ -1004,7 +1000,7 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
 #pragma unroll
     for (int s2 = 0; s2 < QP_NST - 1; s2++) issue(tile0 + s2);
-    asm volatile("cp.async.wait_group %0;" ::"n"(QP_NST - 2));
+    qe::cuda_compat::copy_wait<QP_NST - 2>();
     __syncthreads();
     if (tile0 < tile1) convert(tile0, 0);
     __syncthreads();
@@ -1110,12 +1106,12 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
                 mma16(o[2 * dp + 1], a, b[2], b[3]);
             }
         }
-        asm volatile("cp.async.wait_group %0;" ::"n"(QP_NST - 2));
+        qe::cuda_compat::copy_wait<QP_NST - 2>();
         __syncthreads();
         if (tile + 1 < tile1) convert(tile + 1, buf ^ 1);
         __syncthreads();
     }
-    asm volatile("cp.async.wait_group 0;");
+    qe::cuda_compat::copy_wait<0>();
 #pragma unroll
     for (int x = 1; x <= 2; x <<= 1) {
         l0 += __shfl_xor_sync(0xffffffffu, l0, x);

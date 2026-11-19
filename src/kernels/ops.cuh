@@ -326,6 +326,7 @@ struct DnConvIn {
     const float* dt_bias = nullptr;
 };
 // Chunked delta rule (dn_chunk.cu) for prompts of at least dn_chunk_min() tokens (0 = off)
+bool dn_chunk_supported();
 int dn_chunk_min();
 // the sequential recurrence regardless of dn_chunk_min (reference for tests)
 void dn_core_seq(const float* conv_out, int ch, const DeltaShape& s, const float* ab, const float* A,

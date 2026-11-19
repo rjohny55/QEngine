@@ -35,6 +35,13 @@ void qe_fatal_begin();
         }                                                                      \
     } while (0)
 
+inline int qe_shared_memory_limit() {
+    int device, limit;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    return limit;
+}
+
 typedef __nv_bfloat16 bf16;
 
 // env_int / env_double / env_ll / env_str (env.h): empty = unset. env_int reads on every call (not

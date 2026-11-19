@@ -130,6 +130,7 @@ def run(tier0):
 
     # 2. OpenAI streaming tool call
     t = c.post("/v1/chat/completions", json={"model": name, "stream": True, "tools": TOOLS_OAI, "temperature": 0.7,
+                                              "stream_options": {"include_usage": True, "continuous_usage_stats": True},
                                              "messages": [{"role": "user", "content": "zeige die Dateien"}]}).text
     ev = sse_events(t)
     calls = [d for e in ev for ch in e["choices"] for d in [ch["delta"]] if "tool_calls" in d]
@@ -137,6 +138,12 @@ def run(tier0):
     tc = calls[0]["tool_calls"][0]["function"]
     assert tc["name"] == "Bash" and json.loads(tc["arguments"]) == {"command": "ls -la ~/größe", "timeout": 30}, tc
     assert [ch["finish_reason"] for e in ev for ch in e["choices"] if ch["finish_reason"]] == ["tool_calls"]
+    first_tool = next(i for i, event in enumerate(ev)
+                      if any(choice["delta"].get("tool_calls") for choice in event["choices"]))
+    early_counts = [event["usage"]["completion_tokens"] for event in ev[:first_tool] if "usage" in event]
+    assert early_counts and 0 < early_counts[0] <= ev[-1]["usage"]["completion_tokens"], ev
+    assert early_counts == sorted(early_counts), early_counts
+    assert all(not event["choices"] for event in ev if "usage" in event)
     assert ev[-1]["usage"]["completion_tokens"] > 0
     print("  openai stream: tool call ok")
 

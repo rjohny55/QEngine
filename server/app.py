@@ -30,6 +30,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
+from typing import NamedTuple
 
 import jinja2
 import uvicorn
@@ -250,6 +251,12 @@ class Template:
 _BYTES = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
 _BYTE_OF = {chr(b): b for b in _BYTES}
 _BYTE_OF.update({chr(256 + i): b for i, b in enumerate(b for b in range(256) if b not in _BYTES)})
+
+
+class TokenUsageProgress(NamedTuple):
+    prompt_tokens: int
+    completion_tokens: int
+    cached_tokens: int
 
 
 class LpText(str):
@@ -2078,6 +2085,8 @@ class Job:
     def __init__(self, gen, ids, p, on_text, cancelled, affinity):
         self.gen, self.ids, self.p, self.on_text, self.cancelled = gen, ids, p, on_text, cancelled
         self.affinity = affinity
+        self.continuous_usage = p.get("continuous_usage", False)
+        self.last_usage_at = 0.0
         self.lp = p.get("logprobs")
         self.grammar, self.grammar_s, self.gsteps = None, 0.0, 0  # structured output (begin_start)
         self.glk = None  # TokenLookup of a constrained reply (grammar.py)
@@ -2350,6 +2359,11 @@ class Job:
                 pending = pending[:i]
                 break
         self.n += len(pending)
+        if self.continuous_usage and pending:
+            now = time.monotonic()
+            if not self.last_usage_at or now - self.last_usage_at >= 0.15:
+                self.last_usage_at = now
+                self.on_text(TokenUsageProgress(len(self.ids), self.n, self.reused))
         entry = self.lp_token(pending[0]) if self.lp is not None and pending else None
         if self.tc is not None:
             self.tc.track(pending)
@@ -3318,7 +3332,17 @@ def build_app(gen: Generator, args):
             return u
 
         if body.get("stream"):
+            options = body.get("stream_options")
+            params["continuous_usage"] = (isinstance(options, dict) and options.get("include_usage") is True
+                                          and options.get("continuous_usage_stats") is True)
+
             async def sse():
+                def usage_chunk(stats):
+                    return "data: " + json.dumps({
+                        "id": rid, "object": "chat.completion.chunk", "created": created,
+                        "model": model_name, "choices": [], "usage": usage(stats),
+                    }) + "\n\n"
+
                 lp_buf = []  # logprobs entries that wait for a content chunk (the parser may hold text back)
 
                 def chunk(delta, finish=None, extra=None):
@@ -3347,6 +3371,9 @@ def build_app(gen: Generator, args):
                     if not started:  # role chunk with the first token: clients measure TTFT on it
                         started = True
                         yield chunk({"role": "assistant", "content": ""})
+                    if isinstance(item, TokenUsageProgress):
+                        yield usage_chunk(item._asdict())
+                        continue
                     if isinstance(item, dict):
                         st = item
                         for kind, t in parser.feed("", final=True, promote=st.get("promote_call", False)):
@@ -3362,8 +3389,7 @@ def build_app(gen: Generator, args):
                         lp_buf.extend(st.get("logprobs", ()))
                         yield chunk({}, finish)
                         # usage in its own chunk with empty choices (OpenAI stream_options.include_usage)
-                        yield "data: " + json.dumps({"id": rid, "object": "chat.completion.chunk", "created": created,
-                                                     "model": model_name, "choices": [], "usage": usage(st)}) + "\n\n"
+                        yield usage_chunk(st)
                         yield "data: [DONE]\n\n"
                         log_stats("chat", st)
                         if STEP_PROF and sse_s[1]:

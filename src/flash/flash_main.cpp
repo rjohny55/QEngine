@@ -291,15 +291,21 @@ int main(int argc, char** argv) {
         }
         plans = make_plan(ng, wts);
     }
-    std::vector<int> draft_ids;  // MTP draft vocabulary: the most frequent tokens (token_rank.bin)
+    // Full vocabulary unless the user explicitly requests a frequency-ranked subset.
+    std::vector<int> draft_ids;
     {
-        const int nd = env_int("FLASH_DRAFT_V", 65536);
-        FILE* f = fopen((model + "/token_rank.bin").c_str(), "rb");
-        if (f && nd > 0) {
-            draft_ids.resize(nd);
-            draft_ids.resize(fread(draft_ids.data(), 4, nd, f));
-            fclose(f);
+        const int nd = env_int("FLASH_DRAFT_V", 0);
+        if (nd > 0) {
+            if (FILE* f = fopen((model + "/token_rank.bin").c_str(), "rb")) {
+                const int count = std::min(nd, VOCAB);
+                draft_ids.resize(count);
+                draft_ids.resize(fread(draft_ids.data(), 4, count, f));
+                fclose(f);
+            }
         }
+        printf("MTP draft vocabulary: %zu / %d tokens%s\n",
+               draft_ids.empty() ? (size_t)VOCAB : draft_ids.size(), VOCAB,
+               draft_ids.empty() ? " (full)" : " (explicit frequency-ranked subset)");
     }
     std::vector<std::vector<int>> cold;
     if (cold_file == "default") cold_file = model + "/cold_experts.json";

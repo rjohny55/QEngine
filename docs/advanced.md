@@ -437,8 +437,8 @@ the block mode, which uses the same index map without the paper's training for b
 | `QE_TUNE_RETUNE` | `0` | Both models: `1` tunes the GEMMs again and overwrites the table (e.g. after a hardware change the table's key does not see). |
 | `QE_KV_SCALES` | unset | Safetensors file with `k_scale` / `v_scale` for a checkpoint without FP8 KV scales, e.g. the `model.safetensors` of the 27B INT4 checkpoint. Without them the KV cache is bf16: half the pool, no KV position split. |
 | `QE_INT8_MTP_FT` | `0` | INT8 checkpoints: `1` uses the fine-tuned MTP head (`model_mtp_ft.safetensors`, trained on INT4 outputs) instead of the checkpoint's own. An explicit `--mtp-file` always wins. |
-| `QE_DRAFT_VOCAB` | `98304` | Draft vocabulary of the 27B draft heads: the most frequent tokens (`0` = full vocabulary). The DFlash2 drafter uses all of them (98,304 reaches the full vocabulary's acceptance; 65,536 before); MTP drafts use the first `QE_MTP_VOCAB` of them. Drafts only: outputs are unchanged. |
-| `QE_MTP_VOCAB` | `65536` | Most frequent tokens the 27B MTP draft head scores (a part of the `QE_DRAFT_VOCAB` rows, no second copy); larger costs batched decode speed (c=8 -1.4 % at 98,304). |
+| `QE_DRAFT_VOCAB` | `0` | Full 27B draft vocabulary on all GPUs. A positive value explicitly selects the most frequent tokens from `token_rank.bin`; this can hurt acceptance in languages/domains absent from that ranking. It restricts draft proposals, not target verification. |
+| `QE_MTP_VOCAB` | `0` | MTP uses all available draft-head rows. With an explicit `QE_DRAFT_VOCAB` subset, a positive value further limits its prefix. Zero does not undo an explicitly selected parent subset. |
 | `QE_DF_UNARY_EXACT` | `1` | One card with the INT4 verify head (`QE_HEAD4R` > 0): the DFlash2 selector scores its 16 candidates per draft from the exact BF16 head rows (the verify head's pinned host rows, about 1.2 MB over PCIe per block) instead of the INT4 draft head; more drafts accepted, outputs unchanged. `0` = INT4 scores (also the multi-card path). On a card behind a narrow PCIe link (x4 / x8 chipset slot) try `0`. |
 | `QE_DF_BATCH` | `2` on one card, `0` on more | Batched steps of up to this many conversations draft with DFlash2, each with its own context ring (see the [README](../README.md#dflash2-block-drafter-27b-on-when-it-fits)); `0` = batched steps draft with MTP. |
 | `QE_DF_SIB` | `1` | 27B on one card, greedy replies: when the DFlash2 drafter is unsure about the first three drafts, a step verifies four drafts plus the drafter's second choice for each of the first three positions, in the same 8 rows; when a second choice is right the step keeps one more token. Same text as without it. About 3.5 % faster on mixed prompts (1.5-2.7 % at 32K-96K). `0` = plain 7-draft steps. |
@@ -1104,3 +1104,27 @@ greedy agreement and MTP acceptance, needles found at 5K-200K tokens.
 | `[gemm] GPU<n> <buffer>: out of memory growing to ... MB: ..., retrying` | A GEMM workspace had to grow after start and did not fit; the engine dropped cached graphs and retried. | As above. |
 | The server does not start: `not enough GPU memory for a KV cache` (27B) | Too many sequence slots for the free VRAM (e.g. one card). | Lower `QE_MAX_SEQS`, leave `--vision` off, or lower `QE_RESERVE_GB`. |
 | A desktop on one of the cards stutters or runs out of VRAM | The engine filled the card. | Flash-Next: `FLASH_EC_MARGIN_MB=256,2048,256` (one value per card); 27B: `QE_RESERVE_GB=1.5,3,1.5`. |
+
+### Draft vocabulary policy (NeithOS)
+
+Qwen3.8-27B DFlash2 and MTP, and Flash-Next MTP, use the full model
+vocabulary by default on SM75, SM80 and SM86. A cached `token_rank.bin` no
+longer silently enables frequency pruning. Flash-Next server and `flash_run`
+share the same `FLASH_DRAFT_V=0` default; a positive value opts into a ranked
+subset. Full-vocabulary scoring can cost more per step and consume more logit
+scratch memory; its benefit depends on acceptance and the workload.
+
+For an explicit legacy 27B comparison, set `QE_DRAFT_VOCAB=98304` and
+`QE_MTP_VOCAB=65536`; Flash-Next's former limit was `FLASH_DRAFT_V=65536`.
+Remove these overrides to restore the full-vocabulary default. `QE_DF_HEAD=full`
+also explicitly selects the full DFlash head.
+
+Validation on two CMP50 (SM75) cards: Qwen3.8-27B Pi INT8, W4A16 DFlash2,
+32K context, 8-bit KV, concurrency one, greedy decoding, 384 output tokens,
+two repetitions of Russian prose and English code. Default DFlash full vocabulary
+matched explicit full-vocabulary output hashes: 44.42 / 102.55 tok/s respectively.
+MTP full vocabulary measured 44.70 / 63.39 tok/s, versus 34.03 / 81.18 with the
+explicit legacy ranked subset. All tested output hashes matched, but these two
+bounded prompts do not establish universal equivalence or long-run stability.
+SM75/SM80/SM86 dense and Flash-Next libraries and CLI compiled; nine CPU tests
+passed. SM80/SM86 and Flash-Next GPU inference were not measured in this check.

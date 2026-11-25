@@ -3664,11 +3664,21 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         }
     }
     if (e->ng <= kMaxTp && par != flash_pp::Par::PP) e->plans = make_plan(e->ng, wts);
+    // Keep the server and flash_run vocabulary policy identical on every GPU.
     std::vector<int> draft_ids;
-    if (FILE* f = fopen((model + "/token_rank.bin").c_str(), "rb")) {
-        draft_ids.resize(65536);
-        draft_ids.resize(fread(draft_ids.data(), 4, 65536, f));
-        fclose(f);
+    {
+        const int nd = env_int("FLASH_DRAFT_V", 0);
+        if (nd > 0) {
+            if (FILE* f = fopen((model + "/token_rank.bin").c_str(), "rb")) {
+                const int count = std::min(nd, VOCAB);
+                draft_ids.resize(count);
+                draft_ids.resize(fread(draft_ids.data(), 4, count, f));
+                fclose(f);
+            }
+        }
+        printf("MTP draft vocabulary: %zu / %d tokens%s\n",
+               draft_ids.empty() ? (size_t)VOCAB : draft_ids.size(), VOCAB,
+               draft_ids.empty() ? " (full)" : " (explicit frequency-ranked subset)");
     }
     std::vector<std::vector<int>> cold;
     const std::string cf = env_str("FLASH_COLD") ? env_str("FLASH_COLD") : model + "/cold_experts.json";

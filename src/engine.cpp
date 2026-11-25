@@ -256,21 +256,16 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     }
     for (size_t r = 0; r < devices.size(); r++)
         workers_.emplace_back(new Worker(cfg_, plan_, r, devices[r], comm_));
-    // MTP drafts only over the most frequent tokens (tools/draft_vocab.py ranking), split
-    // across GPUs; QE_DRAFT_VOCAB=0 uses the full vocabulary; QE_TOKEN_RANK_FILE: the ranking file
-    // (default <model_dir>/token_rank.bin; the server sets it to its cached download)
+    // Full vocabulary is the default on every GPU. Frequency-ranked subsets can
+    // miss common tokens outside the ranking's language/domain and reduce acceptance.
+    // Positive QE_DRAFT_VOCAB / QE_MTP_VOCAB values explicitly opt into pruning.
     {
-        // [q27-acc-head] 98,304 (was 65,536): the DFlash2 block drafter reaches the full vocabulary's acceptance
-        // (1 card Swift: sb3 3.080 -> 3.209 tok/step, 30-prompt mix 3.834 -> 3.909) for +0.04 ms per step.
-        // [q27-vocab-mtp] (review q27_1card3 M2) the MTP draft head keeps the 65,536 most frequent (QE_MTP_VOCAB): with
-        // 98,304 batched decode lost 1.4 % at c=8 (1 card, 537.0 -> 529.5 tok/s). Rows are kept in frequency order
-        // (dealt round-robin to the cards), so the MTP head is the first rows of the same matrix: no second copy
-        int nd = env_int("QE_DRAFT_VOCAB", 98304);
-        int nm = env_int("QE_MTP_VOCAB", 65536);
+        int nd = env_int("QE_DRAFT_VOCAB", 0);
+        int nm = env_int("QE_MTP_VOCAB", 0);
         const std::string rank_file = env_str("QE_TOKEN_RANK_FILE") ? env_str("QE_TOKEN_RANK_FILE")
                                                                     : model_dir + "/token_rank.bin";
-        FILE* f = fopen(rank_file.c_str(), "rb");
-        if (f && nd > 0 && mtp_st_) {
+        FILE* f = nd > 0 && mtp_st_ ? fopen(rank_file.c_str(), "rb") : nullptr;
+        if (f) {
             nd = std::min(nd, cfg_.vocab) / (16 * (int)devices.size()) * 16 * devices.size();
             std::vector<int> rank(nd);
             CHECK(fread(rank.data(), 4, nd, f) == (size_t)nd, "token_rank.bin");
@@ -285,6 +280,8 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
             printf("draft vocabulary: %d most frequent tokens (DFlash2 head), MTP drafts the first %d\n", nd, nm);
         }
         if (f) fclose(f);
+        if (workers_.front()->draft_ids.empty())
+            printf("draft vocabulary: full (%d tokens, DFlash2 and MTP)\n", cfg_.vocab);
     }
     pool_.reset(new GpuPool(devices));
     if (env_str("QE_LSA")) {  // LSA refusals before anything is allocated: one behaviour (off, the reason on stdout)
@@ -5733,7 +5730,7 @@ void Engine::dfl_init(const std::string& model_dir, int req_ctx) {
     memcpy(dfl_pred_, pc.data, pc.nbytes);
     memcpy(dfl_succ_, sc.data, sc.nbytes);
     std::string head = env_str("QE_DF_HEAD") ? env_str("QE_DF_HEAD") : "";
-    const bool full = head == "full";
+    const bool full = head == "full" || workers_.front()->draft_ids.empty();
     std::vector<char> ok(workers_.size(), 0);
     pool_->run([&](int r) { ok[r] = workers_[r]->dfl_load(*dfl_st_, dfl_pred_, dfl_succ_, rings, full, dfl_cb_rows_); });
     dfl_st_.reset();  // weights uploaded, codebooks copied: the file mapping is not needed (review L4)

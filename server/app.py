@@ -4670,6 +4670,8 @@ def parse_args(argv=None):
                          "scaling, factor context / 262144 (27B: QE_YARN, Flash-Next: FLASH_YARN, and needs FLASH_KV=ram). "
                          "Never above the KV pool: a smaller pool lowers it and the server starts anyway (start-up line "
                          "'context: requested ..., KV pool ..., served ...')")
+    ap.add_argument("--draft-vocab", choices=("full", "restricted"), default=None,
+                    help="Qwen3.8 draft vocabulary: full or frequency-ranked restricted (27B: DFlash 98304 / MTP 65536; Flash-Next: 65536). Overrides vocabulary env settings; default: engine/env policy")
     ap.add_argument("--mtp-k", type=int, default=None,
                     help="max MTP drafts per step (adaptive; default per model: 27B 7, Flash-Next 3)")
     ap.add_argument("--temperature", type=float, default=None,
@@ -4861,6 +4863,11 @@ def parse_args(argv=None):
     if args.main_bonus is not None:  # (review M2: old command lines keep starting)
         print("[sched] --main-bonus is ignored: no main-thread priority since 2026-11-12 (every conversation alike)", flush=True)
     resolve_model_args(args)
+    from draft_vocab import configure as configure_draft_vocab
+    try:
+        configure_draft_vocab(args.draft_vocab, args.profile.family, os.environ)
+    except ValueError as ex:
+        ap.error(str(ex))
     # [feature-matrix] flags / variables that have no effect for this model: logged by main() after the log starts
     args.ignored_start = ignored_settings(args.profile.family, args.given, env0, args=args)
     args.env0 = env0

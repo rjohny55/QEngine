@@ -323,6 +323,7 @@ class Knob:
 
 # server flags (argparse dest -> row); only flags given on the command line are checked
 FLAGS = {
+    "draft_vocab": Knob(QWEN),
     "lsa": Knob({Q27}, when=lambda v, a: str(v).strip().lower() not in _OFF, note="Latent Sparse Attention is for Qwen3.8-27B only; the model keeps its own attention"),
     "vision": Knob(QWEN, note="no image input; images in requests are replaced by a text note",
                    when=lambda v, a: bool(v)),

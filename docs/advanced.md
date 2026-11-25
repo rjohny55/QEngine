@@ -1128,3 +1128,9 @@ explicit legacy ranked subset. All tested output hashes matched, but these two
 bounded prompts do not establish universal equivalence or long-run stability.
 SM75/SM80/SM86 dense and Flash-Next libraries and CLI compiled; nine CPU tests
 passed. SM80/SM86 and Flash-Next GPU inference were not measured in this check.
+
+Select the policy explicitly at server launch with `--draft-vocab full` or
+`--draft-vocab restricted`. The flag overrides vocabulary environment settings,
+including a stale `QE_DF_HEAD=full`. Without the flag, existing low-level overrides
+remain effective. Restricted mode needs `token_rank.bin`; native startup logs show
+the actual vocabulary used (full vocabulary if no ranking is available).
